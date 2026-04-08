@@ -7,73 +7,76 @@ WORKSPACE="$HOME/rpi_arch_build"
 BASE_IMG="rpi_arch_base.img"
 RPI5_IMG="rpi5_master.img"
 
+# Arch Linux ARM Mirror for RPi 5 packages
+MIRROR="http://mirror.archlinuxarm.org/aarch64/alarm"
+PKGS=(
+    "linux-rpi-6.6.22-1-aarch64.pkg.tar.zst"
+    "raspberrypi-bootloader-20240314-1-any.pkg.tar.zst"
+    "raspberrypi-firmware-20240314-1-aarch64.pkg.tar.zst"
+)
+
 mkdir -p "$WORKSPACE"
 cd "$WORKSPACE"
 
 echo "--- Step 1: Cloning Base Image for RPi 5 ---"
-if [ ! -f "$RPI5_IMG" ]; then
-    cp "$BASE_IMG" "$RPI5_IMG"
-    echo "Created $RPI5_IMG."
-else
-    echo "$RPI5_IMG already exists. Patching existing file..."
-fi
+cp "$BASE_IMG" "$RPI5_IMG"
 
-echo "--- Step 2: Patching Kernel for RPi 5 via Docker ---"
-# Note: Removed the qemu volume mount as it's not needed on Apple Silicon
+echo "--- Step 2: Injecting RPi 5 Kernel/Firmware (Offline) ---"
 docker run --rm --privileged \
     -v "$WORKSPACE":/work \
     ubuntu:22.04 bash -c "
     set -e
     export DEBIAN_FRONTEND=noninteractive
-
-    echo 'Installing dependencies (kpartx, fdisk, libarchive)...'
-    apt-get update -qq
-    apt-get install -y -qq kpartx fdisk e2fsprogs dosfstools libarchive-tools > /dev/null
+    
+    echo 'Installing injection tools (zstd, kpartx)...'
+    apt-get update -qq && apt-get install -y -qq kpartx wget zstd > /dev/null
 
     cd /work
     
-    echo 'Mapping partitions...'
-    # Clean up any stale mappings
+    # Download packages if not present
+    for pkg in ${PKGS[@]}; do
+        if [ ! -f \"\$pkg\" ]; then
+            echo \"Downloading \$pkg...\"
+            wget -q \"$MIRROR/\$pkg\"
+        fi
+    done
+
+    echo 'Mapping image partitions...'
     kpartx -d $RPI5_IMG || true
-    
-    # Map partitions and capture output
     KOUT=\$(kpartx -asv $RPI5_IMG)
-    echo \"\$KOUT\"
-    
-    # Identify mapper nodes
     BOOT_MAPPER=\$(echo \"\$KOUT\" | grep 'p1 ' | awk '{print \$3}')
     ROOT_MAPPER=\$(echo \"\$KOUT\" | grep 'p2 ' | awk '{print \$3}')
     
-    mkdir -p /mnt/rpi5
-    mount \"/dev/mapper/\$ROOT_MAPPER\" /mnt/rpi5
-    mount \"/dev/mapper/\$BOOT_MAPPER\" /mnt/rpi5/boot
+    mkdir -p /mnt/root
+    mount \"/dev/mapper/\$ROOT_MAPPER\" /mnt/root
+    mkdir -p /mnt/root/boot
+    mount \"/dev/mapper/\$BOOT_MAPPER\" /mnt/root/boot
 
-    echo 'Injecting RPi 5 specific kernel and firmware...'
-    # We use 'chroot' to run pacman inside the Arch image.
-    # On M1/M2/M3 Macs, this runs at native speed.
-    chroot /mnt/rpi5 /usr/bin/bash -c \"
-        set -e
-        # Initialize pacman keys
-        pacman-key --init
-        pacman-key --populate archlinuxarm
-        
-        # Update system and swap kernels
-        # linux-rpi is the package for RPi 4 and 5
-        pacman -Sy --noconfirm
-        pacman -R --noconfirm linux-aarch64 || true
-        pacman -S --noconfirm linux-rpi raspberrypi-bootloader raspberrypi-firmware
-    \"
+    echo 'Injecting files into image (Manual Extraction)...'
+    # We extract the packages directly into the mount points
+    # This bypasses the need to 'run' any Arch binaries
+    for pkg in ${PKGS[@]}; do
+        echo \"Extracting \$pkg...\"
+        # Use tar with zstd support
+        tar --zstd -xpf \"\$pkg\" -C /mnt/root
+    done
 
-    echo 'Finalizing boot configuration...'
-    # Ensure the RPi 5 knows how to find its partitions
-    echo '/dev/mmcblk0p1  /boot   vfat    defaults        0       0' > /mnt/rpi5/etc/fstab
-    echo '/dev/mmcblk0p2  /       ext4    defaults,noatime  0       1' >> /mnt/rpi5/etc/fstab
+    echo 'Cleaning up generic kernel traces...'
+    rm -f /mnt/root/boot/Image
+    rm -rf /mnt/root/usr/lib/modules/*-ARCH
+
+    echo 'Updating fstab...'
+    echo '/dev/mmcblk0p1  /boot   vfat    defaults        0       0' > /mnt/root/etc/fstab
+    echo '/dev/mmcblk0p2  /       ext4    defaults,noatime  0       1' >> /mnt/root/etc/fstab
+
+    echo 'Configuring cmdline.txt for RPi 5...'
+    echo 'root=/dev/mmcblk0p2 rw rootwait console=serial0,115200 console=tty1 selinux=0 plymouth.enable=0 smsc95xx.turbo_mode=N dwc_otg.lpm_enable=0 kgdboc=serial0,115200' > /mnt/root/boot/cmdline.txt
 
     sync
-    echo 'Unmounting and cleaning up...'
-    umount -R /mnt/rpi5
+    echo 'Unmounting...'
+    umount -R /mnt/root
     kpartx -d $RPI5_IMG
-    echo 'Patch complete.'
+    echo 'RPi 5 Patch Complete.'
 "
 
 echo "------------------------------------------------"
