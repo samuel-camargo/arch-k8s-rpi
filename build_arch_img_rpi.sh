@@ -9,9 +9,6 @@ WORKSPACE="$HOME/rpi_arch_build"
 BASE_IMG="rpi_arch_base.img"
 RPI5_IMG="rpi5_master.img"
 
-# Mirror for Arch base packages
-MIRROR_CORE="http://fl.us.mirror.archlinuxarm.org/aarch64/core"
-
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -24,6 +21,10 @@ mkdir -p "$WORKSPACE"
 cd "$WORKSPACE"
 
 log "Step 1: Preparing Clean Image"
+if [ ! -f "$BASE_IMG" ]; then
+    echo -e "${RED}Error: $BASE_IMG not found.${NC}"
+    exit 1
+fi
 cp "$BASE_IMG" "$RPI5_IMG"
 
 log "Step 2: Launching Docker for Hardware-Level Injection"
@@ -34,21 +35,36 @@ docker run --rm --privileged \
     set -e
     export DEBIAN_FRONTEND=noninteractive
     
-    echo 'Installing system dependencies...'
-    apt-get update -qq && apt-get install -y -qq kpartx wget zstd xz-utils fdisk curl git kmod > /dev/null
+    echo 'Installing system dependencies (Added ca-certificates)...'
+    apt-get update -qq
+    apt-get install -y -qq kpartx curl ca-certificates xz-utils fdisk dosfstools e2fsprogs kmod > /dev/null
 
     cd /work
+    # Fix loop nodes
     for i in {0..15}; do [ ! -b /dev/loop\$i ] && mknod /dev/loop\$i b 7 \$i || true; done
 
-    echo 'Downloading official RPi Stable Kernel/Firmware (This is the guarantee)...'
-    # We download only the necessary blobs from the official repo
+    echo 'Downloading official RPi Foundation Stable Kernel/Firmware...'
     mkdir -p rpi-firmware
-    wget -q https://github.com/raspberrypi/firmware/raw/master/boot/kernel8.img -O rpi-firmware/kernel8.img
-    wget -q https://github.com/raspberrypi/firmware/raw/master/boot/bcm2712-rpi-5-b.dtb -O rpi-firmware/bcm2712-rpi-5-b.dtb
     
-    # Download the essential bootloader files
-    for f in fixup.dat start.elf fixup4.dat start4.elf fixup8.dat start8.elf; do
-        wget -q https://github.com/raspberrypi/firmware/raw/master/boot/\$f -O rpi-firmware/\$f
+    # Using curl -L to follow redirects and showing progress
+    RAW_URL='https://github.com/raspberrypi/firmware/raw/master/boot'
+    
+    FILES=(
+        'kernel8.img'
+        'bcm2712-rpi-5-b.dtb'
+        'fixup.dat'
+        'start.elf'
+        'fixup4.dat'
+        'start4.elf'
+        'fixup8.dat'
+        'start8.elf'
+    )
+
+    for f in \"\${FILES[@]}\"; do
+        if [ ! -f \"rpi-firmware/\$f\" ]; then
+            echo \"Fetching \$f...\"
+            curl -L \"\$RAW_URL/\$f\" -o \"rpi-firmware/\$f\" --progress-bar
+        fi
     done
 
     echo 'Mapping image partitions...'
@@ -62,12 +78,12 @@ docker run --rm --privileged \
     mkdir -p /mnt/root/boot
     mount \"/dev/mapper/\$BOOT_MAPPER\" /mnt/root/boot
 
-    echo 'Wiping unstable boot files...'
+    echo 'Wiping old boot files...'
     rm -rf /mnt/root/boot/*
 
     echo 'Injecting Stable Kernel and Device Tree...'
     cp rpi-firmware/* /mnt/root/boot/
-    # Official kernel expects to be named kernel8.img or Image
+    # Ensure the kernel is named exactly what config.txt looks for
     cp rpi-firmware/kernel8.img /mnt/root/boot/Image
 
     echo 'Injecting WiFi Configuration...'
@@ -87,33 +103,31 @@ Name=wlan0
 [Network]
 DHCP=yes
 EOF
-    # Force services to be enabled
+
+    # Force enable services
     ln -sf /usr/lib/systemd/system/wpa_supplicant@.service /mnt/root/etc/systemd/system/multi-user.target.wants/wpa_supplicant@wlan0.service
     ln -sf /usr/lib/systemd/system/systemd-networkd.service /mnt/root/etc/systemd/system/multi-user.target.wants/systemd-networkd.service
     ln -sf /usr/lib/systemd/system/sshd.service /mnt/root/etc/systemd/system/multi-user.target.wants/sshd.service
 
-    echo 'Configuring Ultimate Compatibility Boot Files...'
-    # Use config.txt settings that force the keyboard and USB alive
+    echo 'Configuring Hardware Compatibility...'
     cat <<EOF > /mnt/root/boot/config.txt
 arm_64bit=1
-# Force 4k page size compatibility
 kernel=Image
 device_tree=bcm2712-rpi-5-b.dtb
 usb_max_current_enable=1
-# Force USB controller to stay awake
+# Force USB controller to stay active
 dtparam=pcie_aspm=off
+# UART for debugging if needed
+enable_uart=1
 EOF
 
-    # cmdline.txt: We use 'rw' early and force the terminal to tty1
     echo \"root=/dev/mmcblk0p2 rw rootwait console=tty1 selinux=0\" > /mnt/root/boot/cmdline.txt
 
-    echo 'Allowing Root login without password (FOR RECOVERY)...'
-    # This ensures that even if typing works but login fails, you get in
+    echo 'Bypassing root password...'
     sed -i 's/root:\*:/root::/' /mnt/root/etc/shadow
-    sed -i 's/#PermitEmptyPasswords no/PermitEmptyPasswords yes/' /mnt/root/etc/ssh/sshd_config
-    sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /mnt/root/etc/ssh/sshd_config
-
+    
     sync
+    echo 'Cleaning up...'
     umount -R /mnt/root
     kpartx -d $RPI5_IMG
     echo 'Done.'
