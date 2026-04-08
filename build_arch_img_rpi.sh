@@ -1,8 +1,8 @@
 #!/bin/bash
-
+# Stop script on any error
 set -e
 
-# --- CONFIGURATION ---
+# --- CONFIGURATION (UPDATE THESE FOR EACH NODE) ---
 HOSTNAME="kube-master-01"         
 PI_VERSION="5"                    
 STATIC_IP="192.168.1.150/24"      
@@ -26,23 +26,31 @@ B_YELLOW='\033[1;33m'
 B_RED='\033[1;31m'
 NC='\033[0m'
 
+START_TIME=$SECONDS
+
 log_header() { echo -e "\n${B_MAGENTA}🚀 [$(date +%T)] ==================== $1 ====================${NC}"; }
 log_step()   { echo -e "${B_CYAN}[⭐]${NC} $1"; }
 log_success(){ echo -e "     ${B_GREEN}✔${NC} $1"; }
 log_error()  { echo -e "${B_RED}[💥 ERROR]${NC} $1\nCheck $LOG_FILE for details."; exit 1; }
 
 mkdir -p "$WORKSPACE"
+echo "--- Build Log Started $(date) ---" > "$LOG_FILE"
 cd "$WORKSPACE"
 
-# PHASE 1: BASE IMAGE
+# =========================================================
+# PHASE 1: BASE IMAGE GENERATION
+# =========================================================
 if [ ! -f "$BASE_IMG" ]; then
     log_header "PHASE 1: BASE ARCHITECTURE"
     [ ! -f "$ARCH_TARBALL" ] && wget -c -O "$ARCH_TARBALL" "http://os.archlinuxarm.org/os/$ARCH_TARBALL" >> "$LOG_FILE" 2>&1
+    
     truncate -s 10G "$BASE_IMG"
     docker run --rm --privileged -v "$WORKSPACE":/work ubuntu:22.04 bash -c "
+        export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq && apt-get install -y -qq fdisk e2fsprogs dosfstools libarchive-tools kpartx kmod >> /work/build.log 2>&1
         cd /work
         for i in {0..63}; do [ ! -b /dev/loop\$i ] && mknod -m 0660 /dev/loop\$i b 7 \$i || true; done
+        wipefs -af $BASE_IMG >> /work/build.log 2>&1
         printf 'o\nn\np\n1\n\n+2G\nt\nc\nn\np\n2\n\n\nw\n' | fdisk $BASE_IMG >> /work/build.log 2>&1
         LOOP=\$(losetup -f --show $BASE_IMG)
         kpartx -as \"\$LOOP\"
@@ -56,7 +64,9 @@ if [ ! -f "$BASE_IMG" ]; then
     " || log_error "Base build failed."
 fi
 
+# =========================================================
 # PHASE 2: CUSTOMIZATION
+# =========================================================
 log_header "PHASE 2: KUBE-NODE HARDENING"
 cp "$BASE_IMG" "$TARGET_IMG"
 
@@ -67,30 +77,36 @@ docker run --rm --privileged \
     -e PI_VERSION="$PI_VERSION" -e TARGET_IMG="$TARGET_IMG" \
     ubuntu:22.04 bash -c "
     set -e
+    export DEBIAN_FRONTEND=noninteractive
+    task() { echo -ne \"\033[1;36m  [⏳]\033[0m \$1... \"; }
+    done_task() { echo -e \"\033[1;32mDONE\033[0m\"; }
+
     apt-get update -qq >> /work/build.log 2>&1 && apt-get install -y -qq kpartx curl xz-utils fdisk wget kmod rsync dosfstools e2fsprogs parted >> /work/build.log 2>&1
     cd /work
     for i in {0..63}; do [ ! -b /dev/loop\$i ] && mknod -m 0660 /dev/loop\$i b 7 \$i || true; done
+    losetup -D
     
+    task 'Mounting Filesystems'
     LOOP_DEV=\$(losetup -f --show \"\$TARGET_IMG\")
     kpartx -as \"\$LOOP_DEV\"
     LNAME=\$(basename \"\$LOOP_DEV\")
     mkdir -p /mnt/target && mount \"/dev/mapper/\${LNAME}p2\" /mnt/target
     mkdir -p /mnt/target/boot && mount \"/dev/mapper/\${LNAME}p1\" /mnt/target/boot
     rm -rf /mnt/target/boot/*
+    done_task
 
-    # --- FIX: ROOT LOGIN ---
-    # We remove any 'root::' lines and explicitly set the password
-    sed -i 's/^root:x:/root:\$6\$stable-password-hash:/' /mnt/target/etc/shadow || true
+    task 'Security & Tool Config'
     echo 'root:root' | chroot /mnt/target chpasswd
     sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/' /mnt/target/etc/ssh/sshd_config
-    
     cat <<EOF_CRI > /mnt/target/etc/crictl.yaml
 runtime-endpoint: unix:///run/containerd/containerd.sock
 image-endpoint: unix:///run/containerd/containerd.sock
 timeout: 10
 debug: false
 EOF_CRI
+    done_task
 
+    task 'Injecting Ironclad Provisioning (v27)'
     cat <<'EOF_PROV' > /mnt/target/usr/local/bin/rpi-provision.sh
 #!/bin/bash
 set -e
@@ -100,24 +116,25 @@ exec > >(tee -a \"\$LOG\") 2>&1
 
 log_prov() {
     local MSG=\"[\$(date +%T)] \$1\"
-    # Print to HDMI and Serial console immediately
     echo -e \"\033[1;32m\$MSG\033[0m\" > /dev/console
     echo \"\$MSG\"
     echo -e \"\n NODE: $HOSTNAME\n STATUS: \$1\n\" > /etc/motd
 }
 
 pacman_retry() {
-    local n=1; local max=5
+    local n=1; local max=5; local delay=10
     while true; do
         log_prov \"🎬 Executing: \$*\"
         if yes | \"\$@\" >> /var/log/provision.log 2>&1; then break;
         else
             if [[ \$n -lt \$max ]]; then
                 ((n++))
+                log_prov \"⚠️ Command failed. Clearing locks and retrying...\"
                 rm -f /var/lib/pacman/db.lck
                 pacman -Sy >> /var/log/provision.log 2>&1 || true
-                sleep 10
+                sleep \$delay
             else
+                echo -e \"\nSTATUS: FAILED AT \$*\n\" > /etc/motd
                 exit 1
             fi
         fi
@@ -125,7 +142,7 @@ pacman_retry() {
 }
 
 log_prov \"🚀 PROVISIONING START\"
-while ! ping -c 1 -W 2 8.8.8.8 &>/dev/null; do sleep 3; done
+for i in {1..30}; do ping -c 1 -W 1 8.8.8.8 &>/dev/null && break || sleep 2; done
 
 log_prov \"🔑 (1/5) Keys...\"
 pacman-key --init && pacman-key --populate archlinuxarm
@@ -135,7 +152,7 @@ log_prov \"📦 (2/5) Update...\"
 sed -i 's/#ParallelDownloads = 5/ParallelDownloads = 10/' /etc/pacman.conf
 pacman_retry pacman -Syu --noconfirm
 
-log_prov \"🏗️ (3/5) K8s Tools...\"
+log_prov \"🏗️ (3/5) K8s & Storage...\"
 pacman_retry pacman -S --noconfirm containerd kubeadm kubelet kubectl runc open-iscsi nfs-utils
 mkdir -p /etc/containerd && containerd config default > /etc/containerd/config.toml
 sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
@@ -172,7 +189,9 @@ StandardError=inherit
 WantedBy=multi-user.target
 EOF
     ln -sf /etc/systemd/system/rpi-provision.service /mnt/target/etc/systemd/system/multi-user.target.wants/rpi-provision.service
+    done_task
 
+    task 'Fetching Drivers'
     K_MIRROR=\"http://fl.us.mirror.archlinuxarm.org/aarch64\"
     K_PKG=\$(curl -sL \$K_MIRROR/core/ | grep -oE 'linux-rpi-[0-9][^[:space:]\"]+\.pkg\.tar\.xz' | grep -v '16k' | grep -v 'headers' | sort -V | tail -n 1)
     DTB=\"bcm2711-rpi-4-b.dtb\"
@@ -180,10 +199,12 @@ EOF
     BOOT=\$(curl -sL \$K_MIRROR/alarm/ | grep -oE 'raspberrypi-bootloader-[^[:space:]\"]+\.pkg\.tar\.xz' | tail -n 1)
     FIRM=\$(curl -sL \$K_MIRROR/alarm/ | grep -oE 'firmware-raspberrypi-[^[:space:]\"]+\.pkg\.tar\.xz' | tail -n 1)
     wget -q \"\$K_MIRROR/core/\$K_PKG\" \"\$K_MIRROR/alarm/\$BOOT\" \"\$K_MIRROR/alarm/\$FIRM\"
-    
-    tar -xpf \"\$K_PKG\" -C /mnt/target
-    tar -xpf \"\$BOOT\" -C /mnt/target
-    tar -xpf \"\$FIRM\" -C /mnt/target
+    done_task
+
+    task 'Finalizing Image'
+    tar -xpf \"\$K_PKG\" -C /mnt/target >> /work/build.log 2>&1
+    tar -xpf \"\$BOOT\" -C /mnt/target >> /work/build.log 2>&1
+    tar -xpf \"\$FIRM\" -C /mnt/target >> /work/build.log 2>&1
     [ -d /mnt/target/boot/boot ] && mv /mnt/target/boot/boot/* /mnt/target/boot/ && rmdir /mnt/target/boot/boot
     
     echo \"\$HOSTNAME\" > /mnt/target/etc/hostname
@@ -202,5 +223,16 @@ EOF
     echo -e \"arm_64bit=1\nkernel=Image\ndevice_tree=\$DTB\nusb_max_current_enable=1\" > /mnt/target/boot/config.txt
     echo \"root=/dev/mmcblk0p2 rw rootwait console=tty1 selinux=0 net.ifnames=0\" > /mnt/target/boot/cmdline.txt
     
-    sync && umount -R /mnt/target && kpartx -d \"\$LOOP_DEV\" && losetup -d \"\$LOOP_DEV\"
+    sync && umount -R /mnt/target && kpartx -d \"\$LOOP_DEV\" >> /work/build.log 2>&1 && losetup -d \"\$LOOP_DEV\"
+    done_task
 " || log_error "Build failed."
+
+# =========================================================
+# FINAL SUMMARY
+# =========================================================
+DURATION=$((SECONDS - START_TIME))
+log_header "BUILD COMPLETE"
+log_success "Target:    ${B_GREEN}$TARGET_IMG${NC}"
+log_success "Time:      ${B_YELLOW}$((DURATION / 60))m $((DURATION % 60))s${NC}"
+log_success "Command:   ${B_CYAN}sudo dd if=$TARGET_IMG of=/dev/diskX bs=4M status=progress${NC}"
+echo -e "\n${B_MAGENTA}=======================================================${NC}"
