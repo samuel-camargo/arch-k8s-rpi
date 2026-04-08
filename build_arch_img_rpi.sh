@@ -18,7 +18,7 @@ BASE_IMG="rpi_arch_base.img"
 TARGET_IMG="${HOSTNAME}.img"
 ARCH_TARBALL="ArchLinuxARM-rpi-aarch64-latest.tar.gz"
 
-# Colors for "Beautiful" Logging
+# Colors
 B_MAGENTA='\033[1;35m'
 B_CYAN='\033[1;36m'
 B_GREEN='\033[1;32m'
@@ -48,7 +48,8 @@ if [ ! -f "$BASE_IMG" ]; then
     truncate -s 10G "$BASE_IMG"
     docker run --rm --privileged -v "$WORKSPACE":/work ubuntu:22.04 bash -c "
         export DEBIAN_FRONTEND=noninteractive
-        apt-get update -qq && apt-get install -y -qq apt-utils fdisk e2fsprogs dosfstools libarchive-tools kpartx kmod > /dev/null 2>&1
+        apt-get update -qq > /dev/null
+        apt-get install -y -qq apt-utils fdisk e2fsprogs dosfstools libarchive-tools kpartx kmod > /dev/null 2>&1
         cd /work
         for i in {0..63}; do [ ! -b /dev/loop\$i ] && mknod -m 0660 /dev/loop\$i b 7 \$i || true; done
         wipefs -af $BASE_IMG > /dev/null 2>&1
@@ -71,7 +72,7 @@ fi
 # =========================================================
 log_header "PHASE 2: CUSTOMIZING FOR $HOSTNAME (RPI $PI_VERSION)"
 
-log_step "Creating Target Image: $TARGET_IMG"
+log_step "Cloning and Mapping Target Image..."
 cp "$BASE_IMG" "$TARGET_IMG"
 
 docker run --rm --privileged \
@@ -97,6 +98,7 @@ docker run --rm --privileged \
     apt-get install -y -qq apt-utils > /dev/null 2>&1
     apt-get install -y -qq kpartx curl xz-utils fdisk wget kmod rsync dosfstools e2fsprogs parted > /dev/null 2>&1
     cd /work
+    rm -f *.pkg.tar.xz* # CLEAN SLATE: Remove stale downloads
     for i in {0..63}; do [ ! -b /dev/loop\$i ] && mknod -m 0660 /dev/loop\$i b 7 \$i || true; done
     losetup -D
     succ
@@ -133,7 +135,6 @@ containerd config default > /etc/containerd/config.toml
 sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
 systemctl enable --now containerd kubelet
 
-# Partition Expand
 ROOT_DEV=\$(findmnt / -o SOURCE -n)
 DISK_DEV=\${ROOT_DEV%p*}
 PART_NUM=\$(echo \$ROOT_DEV | grep -o '[0-9]\$')
@@ -168,21 +169,20 @@ EOF
         KERNEL_PKG=\$(curl -sL \$K_MIRROR/core/ | grep -oE 'linux-rpi-[0-9][^[:space:]\"]+\.pkg\.tar\.xz' | grep -v 'headers' | sort -V | tail -n 1)
         DTB=\"bcm2712-rpi-5-b.dtb\"
     fi
-    
-    # Validation Check
-    if [ -z \"\$KERNEL_PKG\" ]; then echo -e \"\nERROR: Could not find kernel package on mirror!\"; exit 1; fi
-    
-    REGDB=\$(curl -sL \$K_MIRROR/core/ | grep -oE 'wireless-regdb-[^[:space:]\"]+\.pkg\.tar\.xz' | head -n 1)
-    BOOT=\$(curl -sL \$K_MIRROR/alarm/ | grep -oE 'raspberrypi-bootloader-[^[:space:]\"]+\.pkg\.tar\.xz' | tail -n 1)
-    FIRM=\$(curl -sL \$K_MIRROR/alarm/ | grep -oE 'firmware-raspberrypi-[^[:space:]\"]+\.pkg\.tar\.xz' | tail -n 1)
+    REGDB=\$(curl -sL \$K_MIRROR/core/ | grep -oE 'wireless-regdb-[^[:space:]\"]+\.pkg\.tar\.xz' | sort -V | tail -n 1)
+    BOOT=\$(curl -sL \$K_MIRROR/alarm/ | grep -oE 'raspberrypi-bootloader-[^[:space:]\"]+\.pkg\.tar\.xz' | sort -V | tail -n 1)
+    FIRM=\$(curl -sL \$K_MIRROR/alarm/ | grep -oE 'firmware-raspberrypi-[^[:space:]\"]+\.pkg\.tar\.xz' | sort -V | tail -n 1)
     succ
 
     task 'Downloading and Extracting Kernel'
     wget -q \"\$K_MIRROR/core/\$KERNEL_PKG\" \"\$K_MIRROR/core/\$REGDB\" \"\$K_MIRROR/alarm/\$BOOT\" \"\$K_MIRROR/alarm/\$FIRM\"
+    
+    # Explicit filenames for tar to prevent duplicate file suffix errors
     tar -xpf \"\$KERNEL_PKG\" -C /mnt/target
-    tar -xpf \"wireless-regdb\"* -C /mnt/target
-    tar -xpf \"raspberrypi-bootloader\"* -C /mnt/target
-    tar -xpf \"firmware-raspberrypi\"* -C /mnt/target
+    tar -xpf \"\$REGDB\" -C /mnt/target
+    tar -xpf \"\$BOOT\" -C /mnt/target
+    tar -xpf \"\$FIRM\" -C /mnt/target
+    
     [ -d /mnt/target/boot/boot ] && mv /mnt/target/boot/boot/* /mnt/target/boot/ && rmdir /mnt/target/boot/boot
     depmod -b /mnt/target \$(ls /mnt/target/usr/lib/modules | head -n 1)
     succ
@@ -212,7 +212,6 @@ EOF
 " || log_error "Customization Phase Failed"
 
 log_header "SUCCESS: READY TO FLASH"
-echo -e "Node:     ${B_GREEN}$HOSTNAME${NC} (RPi $PI_VERSION)"
-echo -e "IP:       ${B_GREEN}$STATIC_IP${NC}"
-echo -e "Command:  ${B_CYAN}sudo dd if=$TARGET_IMG of=/dev/diskX bs=4M status=progress${NC}"
+echo -e "Node:     ${B_GREEN}$HOSTNAME${NC}"
+echo -e "Flash:    ${B_CYAN}sudo dd if=$TARGET_IMG of=/dev/diskX bs=4M status=progress${NC}"
 log_header "========================================"
