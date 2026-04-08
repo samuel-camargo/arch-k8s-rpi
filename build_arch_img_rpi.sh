@@ -4,8 +4,8 @@
 set -e
 
 # --- CONFIGURATION (UPDATE THESE FOR EACH NODE) ---
-HOSTNAME="kube-worker-03"         # master-01, master-02, worker-01, worker-02, worker-03
-PI_VERSION="4"                    # 4 for RPi4, 5 for RPi5
+HOSTNAME="kube-worker-03"         # Name: master-01, master-02, worker-01, etc.
+PI_VERSION="4"                    # Hardware: 4 or 5
 STATIC_IP="192.168.1.162/24"      # IPs: .150 (M1), .151 (M2), .160 (W1), .161 (W2), .162 (W3)
 GATEWAY="192.168.1.1"
 WIFI_SSID="YOUR_WIFI_NAME"
@@ -105,7 +105,6 @@ docker run --rm --privileged \
     task() { echo -ne \"\033[1;36m  [⏳]\033[0m \$1... \"; }
     done_task() { echo -e \"\033[1;32mDONE\033[0m\"; }
 
-    # Squelch noisy setup
     apt-get update -qq >> /work/build.log 2>&1 && apt-get install -y -qq apt-utils kpartx curl xz-utils fdisk wget kmod rsync dosfstools e2fsprogs parted >> /work/build.log 2>&1
     cd /work
     rm -f *.pkg.tar.xz*
@@ -116,31 +115,45 @@ docker run --rm --privileged \
     LOOP_DEV=\$(losetup -f --show \"\$TARGET_IMG\")
     kpartx -as \"\$LOOP_DEV\"
     LNAME=\$(basename \"\$LOOP_DEV\")
-    
-    # BREADCRUMB: Export mapper paths for visibility
     MAP_BOOT=\"/dev/mapper/\${LNAME}p1\"
     MAP_ROOT=\"/dev/mapper/\${LNAME}p2\"
-    echo \"[DEBUG] Mapper Boot: \$MAP_BOOT\" >> /work/build.log
-    
-    # CRITICAL: Settle time for Docker-on-Mac storage sync
     sleep 3
-    
     mkdir -p /mnt/target && mount \"\$MAP_ROOT\" /mnt/target
     mkdir -p /mnt/target/boot && mount \"\$MAP_BOOT\" /mnt/target/boot
     rm -rf /mnt/target/boot/*
     done_task
 
-    task 'Injecting Provisioning Script'
+    task 'Injecting High-Visibility Provisioning'
     cat <<'EOF_PROV' > /mnt/target/usr/local/bin/rpi-provision.sh
 #!/bin/bash
+LOG=\"/var/log/provision.log\"
+touch \$LOG
+exec > >(tee -a \"\$LOG\") 2>&1
+
+log_prov() {
+    local MSG=\"[\$(date +%T)] \$1\"
+    echo -e \"\033[1;32m\$MSG\033[0m\" > /dev/console
+    echo \"\$MSG\"
+    echo -e \"Arch Linux RPi Node: $HOSTNAME\nStatus: \$1\" > /etc/motd
+}
+
+log_prov \"🚀 STARTING FIRST-BOOT PROVISIONING\"
 iw dev wlan0 set power_save off || true
+
+log_prov \"📶 (Step 1/7) Waiting for Internet...\"
 while ! ping -c 1 -W 2 8.8.8.8 &>/dev/null; do sleep 3; done
+
+log_prov \"🔑 (Step 2/7) Initializing Keyring (Takes ~2 min)...\"
 pacman-key --init && pacman-key --populate archlinuxarm
 pacman -Sy archlinux-keyring --noconfirm
+
+log_prov \"📦 (Step 3/7) System Update & K8s Prep...\"
 sed -i 's/#ParallelDownloads = 5/ParallelDownloads = 10/' /etc/pacman.conf
 pacman -Syu --noconfirm
 timedatectl set-ntp true
 swapoff -a && sed -i '/swap/d' /etc/fstab
+
+log_prov \"⚙️ (Step 4/7) Configuring Kernel Modules...\"
 mkdir -p /etc/modules-load.d && echo -e \"overlay\nbr_netfilter\" > /etc/modules-load.d/k8s.conf
 modprobe overlay || true && modprobe br_netfilter || true
 cat <<EOF_SYS > /etc/sysctl.d/k8s.conf
@@ -149,24 +162,35 @@ net.bridge.bridge-nf-call-ip6tables = 1
 net.ipv4.ip_forward                 = 1
 EOF_SYS
 sysctl --system
+
+log_prov \"🏗️ (Step 5/7) Installing Containerd & K8s...\"
 pacman -S --noconfirm containerd kubeadm kubelet kubectl runc
 mkdir -p /etc/containerd && containerd config default > /etc/containerd/config.toml
 sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
 systemctl enable --now containerd kubelet
+
+log_prov \"💾 (Step 6/7) Expanding Filesystem...\"
 ROOT_DEV=\$(findmnt / -o SOURCE -n)
 echo -e \"d\n2\nn\np\n2\n\n\ny\nw\" | fdisk \${ROOT_DEV%p*} > /dev/null 2>&1
 partx -u \${ROOT_DEV%p*} || true && resize2fs \$ROOT_DEV > /dev/null 2>&1
+
+log_prov \"✅ (Step 7/7) COMPLETE! Cluster Node Ready.\"
+echo -e \"Arch Linux RPi Node: $HOSTNAME\nStatus: PROVISIONED / READY\" > /etc/motd
 systemctl disable rpi-provision.service && rm /etc/systemd/system/rpi-provision.service
 EOF_PROV
     chmod +x /mnt/target/usr/local/bin/rpi-provision.sh
-    
+
     cat <<EOF > /mnt/target/etc/systemd/system/rpi-provision.service
 [Unit]
 Description=K8s Provision
 After=network-online.target
+Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/rpi-provision.sh
+StandardOutput=journal+console
+StandardError=journal+console
+TTYPath=/dev/console
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -186,7 +210,6 @@ EOF
     BOOT=\$(curl -sL \$K_MIRROR/alarm/ | grep -oE 'raspberrypi-bootloader-[^[:space:]\"]+\.pkg\.tar\.xz' | tail -n 1)
     FIRM=\$(curl -sL \$K_MIRROR/alarm/ | grep -oE 'firmware-raspberrypi-[^[:space:]\"]+\.pkg\.tar\.xz' | tail -n 1)
     wget -q \"\$K_MIRROR/core/\$K_PKG\" \"\$K_MIRROR/core/\$REG\" \"\$K_MIRROR/alarm/\$BOOT\" \"\$K_MIRROR/alarm/\$FIRM\"
-    echo \"[INFO] Package: \$K_PKG\" >> /work/build.log
     done_task
 
     task 'Extracting & Finalizing'
@@ -214,7 +237,6 @@ EOF
     sed -i 's/^root:[^:]*:/root::/' /mnt/target/etc/shadow
     echo -e \"arm_64bit=1\nkernel=Image\ndevice_tree=\$DTB\nusb_max_current_enable=1\" > /mnt/target/boot/config.txt
     echo \"root=/dev/mmcblk0p2 rw rootwait console=tty1 selinux=0 net.ifnames=0 ipv6.disable=1 cgroup_enable=cpuset cgroup_enable=memory cgroup_memory=1 cfg80211.regdom=\$REG_DOMAIN\" > /mnt/target/boot/cmdline.txt
-    
     sync && umount -R /mnt/target && kpartx -d \"\$LOOP_DEV\" >> /work/build.log 2>&1 && losetup -d \"\$LOOP_DEV\"
     done_task
 " || log_error "Build failed."
