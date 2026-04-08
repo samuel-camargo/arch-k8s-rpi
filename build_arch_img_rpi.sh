@@ -2,9 +2,9 @@
 set -e
 
 # --- CONFIGURATION (Supports 3, 4, 5) ---
-HOSTNAME="kube-master-03"         # Suggesting Master-03 for Quorum!
-PI_VERSION="3"                    
-STATIC_IP="192.168.1.152/24"      
+HOSTNAME="kube-master-01"         
+PI_VERSION="5"                    
+STATIC_IP="192.168.1.150/24"      
 GATEWAY="192.168.1.1"
 WIFI_SSID="YOUR_WIFI_NAME"
 WIFI_PASS="YOUR_WIFI_PASSWORD"
@@ -36,13 +36,12 @@ mkdir -p "$WORKSPACE"
 echo "--- Build Log Started $(date) ---" > "$LOG_FILE"
 cd "$WORKSPACE"
 
-# PHASE 1: VERIFICATION
-log_header "PHASE 1: BASE ARCHITECTURE"
+# PHASE 1: BASE IMAGE
 if [ ! -f "$ARCH_TARBALL" ]; then
-    log_step "Downloading aarch64 Tarball..."
+    log_step "Downloading Arch Tarball..."
     wget -c -O "$ARCH_TARBALL" "http://os.archlinuxarm.org/os/$ARCH_TARBALL" >> "$LOG_FILE" 2>&1
 else
-    log_success "Tarball found. RPi 3, 4, and 5 all share the aarch64 base."
+    log_success "Tarball found. Skipping download."
 fi
 
 if [ ! -f "$BASE_IMG" ]; then
@@ -66,11 +65,11 @@ if [ ! -f "$BASE_IMG" ]; then
         sync && umount -R /mnt/root && kpartx -d \"\$LOOP\" && losetup -d \"\$LOOP\"
     " || log_error "Base build failed."
 else
-    log_success "Existing base image found. Reusing."
+    log_success "Base image found ($BASE_IMG). Reusing."
 fi
 
 # PHASE 2: CUSTOMIZATION
-log_header "PHASE 2: KUBE-NODE HARDENING (RPi $PI_VERSION)"
+log_header "PHASE 2: STABILITY HARDENING (RPi $PI_VERSION)"
 cp "$BASE_IMG" "$TARGET_IMG"
 
 docker run --rm --privileged \
@@ -97,29 +96,20 @@ docker run --rm --privileged \
     rm -rf /mnt/target/boot/*
     done_task
 
-    task 'Security'
+    task 'Injecting Provisioning v32'
     echo 'root:root' | chroot /mnt/target chpasswd
     sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/' /mnt/target/etc/ssh/sshd_config
-    cat <<EOF_CRI > /mnt/target/etc/crictl.yaml
-runtime-endpoint: unix:///run/containerd/containerd.sock
-image-endpoint: unix:///run/containerd/containerd.sock
-timeout: 10
-EOF_CRI
-    done_task
-
-    task 'Injecting Provisioning'
+    
     cat <<'EOF_PROV' > /mnt/target/usr/local/bin/rpi-provision.sh
 #!/bin/bash
 set -e
 LOG=\"/var/log/provision.log\"
-touch \$LOG && chmod 644 \$LOG
 exec > >(tee -a \"\$LOG\") 2>&1
 
 log_prov() {
     local MSG=\"[\$(date +%T)] \$1\"
     echo -e \"\033[1;32m\$MSG\033[0m\" > /dev/tty1
     echo \"\$MSG\"
-    echo -e \"\n NODE: $HOSTNAME\n STATUS: \$1\n\" > /etc/motd
 }
 
 pacman_retry() {
@@ -139,7 +129,7 @@ pacman_retry() {
     done
 }
 
-log_prov \"🚀 START\"
+log_prov \"🚀 PROVISIONING START\"
 for i in {1..30}; do ping -c 1 -W 1 8.8.8.8 &>/dev/null && break || sleep 2; done
 
 log_prov \"🔑 (1/5) Keys...\"
@@ -192,7 +182,6 @@ EOF
     K_MIRROR=\"http://fl.us.mirror.archlinuxarm.org/aarch64\"
     K_PKG=\$(curl -sL \$K_MIRROR/core/ | grep -oE 'linux-rpi-[0-9][^[:space:]\"]+\.pkg\.tar\.xz' | grep -v '16k' | grep -v 'headers' | sort -V | tail -n 1)
     
-    # Universal DTB Selection
     DTB=\"bcm2711-rpi-4-b.dtb\"
     [ \"\$PI_VERSION\" == \"5\" ] && DTB=\"bcm2712-rpi-5-b.dtb\"
     [ \"\$PI_VERSION\" == \"3\" ] && DTB=\"bcm2710-rpi-3-b.dtb\"
@@ -216,14 +205,17 @@ Name=wlan0
 Address=\$STATIC_IP
 Gateway=\$GATEWAY
 DNS=1.1.1.1
+# Fix: Don't hang boot if WiFi is slow
+RequiredForOnline=no
 EOF
     printf \"country=\$REG_DOMAIN\nctrl_interface=/var/run/wpa_supplicant\nupdate_config=1\nnetwork={\n ssid=\\\"\$WIFI_SSID\\\"\n psk=\\\"\$WIFI_PASS\\\"\n}\n\" > /mnt/target/etc/wpa_supplicant/wpa_supplicant-wlan0.conf
     ln -sf /usr/lib/systemd/system/wpa_supplicant@.service /mnt/target/etc/systemd/system/multi-user.target.wants/wpa_supplicant@wlan0.service
     ln -sf /usr/lib/systemd/system/systemd-networkd.service /mnt/target/etc/systemd/system/multi-user.target.wants/systemd-networkd.service
     
     echo -e \"arm_64bit=1\nkernel=Image\ndevice_tree=\$DTB\nusb_max_current_enable=1\" > /mnt/target/boot/config.txt
-    # Added cma=128M for better memory allocation on RPi 3
-    echo \"root=/dev/mmcblk0p2 rw rootwait console=tty1 selinux=0 net.ifnames=0 cma=128M\" > /mnt/target/boot/cmdline.txt
+    
+    # Stability: Disable PCIe power management to prevent keyboard/USB freezes
+    echo \"root=/dev/mmcblk0p2 rw rootwait console=tty1 selinux=0 net.ifnames=0 cma=128M pcie_aspm=off\" > /mnt/target/boot/cmdline.txt
     
     sync && umount -R /mnt/target && kpartx -d \"\$LOOP_DEV\" >> /work/build.log 2>&1 && losetup -d \"\$LOOP_DEV\"
     done_task
