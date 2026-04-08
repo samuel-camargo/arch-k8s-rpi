@@ -1,8 +1,7 @@
 #!/bin/bash
-# Stop script on any error
 set -e
 
-# --- CONFIGURATION (UPDATE THESE FOR EACH NODE) ---
+# --- CONFIGURATION ---
 HOSTNAME="kube-master-01"         
 PI_VERSION="5"                    
 STATIC_IP="192.168.1.150/24"      
@@ -31,19 +30,15 @@ START_TIME=$SECONDS
 log_header() { echo -e "\n${B_MAGENTA}🚀 [$(date +%T)] ==================== $1 ====================${NC}"; }
 log_step()   { echo -e "${B_CYAN}[⭐]${NC} $1"; }
 log_success(){ echo -e "     ${B_GREEN}✔${NC} $1"; }
-log_info()   { echo -e "     ${B_YELLOW}i${NC} $1"; }
 log_error()  { echo -e "${B_RED}[💥 ERROR]${NC} $1\nCheck $LOG_FILE for details."; exit 1; }
 
 mkdir -p "$WORKSPACE"
 echo "--- Build Log Started $(date) ---" > "$LOG_FILE"
 cd "$WORKSPACE"
 
-# =========================================================
 # PHASE 1: BASE IMAGE VERIFICATION
-# =========================================================
 log_header "PHASE 1: BASE ARCHITECTURE"
 
-# Check Tarball
 if [ ! -f "$ARCH_TARBALL" ]; then
     log_step "Arch Linux ARM Tarball missing. Downloading..."
     wget -c -O "$ARCH_TARBALL" "http://os.archlinuxarm.org/os/$ARCH_TARBALL" >> "$LOG_FILE" 2>&1
@@ -51,13 +46,12 @@ else
     log_success "Tarball found ($ARCH_TARBALL). Skipping download."
 fi
 
-# Check/Build Base Image
 if [ ! -f "$BASE_IMG" ]; then
     log_step "Base Image missing. Building 10GB Arch-Base..."
     truncate -s 10G "$BASE_IMG"
     docker run --rm --privileged -v "$WORKSPACE":/work ubuntu:22.04 bash -c "
         export DEBIAN_FRONTEND=noninteractive
-        apt-get update -qq && apt-get install -y -qq fdisk e2fsprogs dosfstools libarchive-tools kpartx kmod >> /work/build.log 2>&1
+        apt-get update -qq && apt-get install -y -qq fdisk e2fsprogs dosfstools libarchive-tools kpartx kmod > /dev/null 2>&1
         cd /work
         for i in {0..63}; do [ ! -b /dev/loop\$i ] && mknod -m 0660 /dev/loop\$i b 7 \$i || true; done
         wipefs -af $BASE_IMG >> /work/build.log 2>&1
@@ -77,9 +71,7 @@ else
     log_success "Existing base image found ($BASE_IMG). Reusing."
 fi
 
-# =========================================================
 # PHASE 2: CUSTOMIZATION
-# =========================================================
 log_header "PHASE 2: KUBE-NODE HARDENING"
 log_step "Cloning base image to $TARGET_IMG..."
 cp "$BASE_IMG" "$TARGET_IMG"
@@ -95,7 +87,9 @@ docker run --rm --privileged \
     task() { echo -ne \"\033[1;36m  [⏳]\033[0m \$1... \"; }
     done_task() { echo -e \"\033[1;32mDONE\033[0m\"; }
 
-    apt-get update -qq >> /work/build.log 2>&1 && apt-get install -y -qq kpartx curl xz-utils fdisk wget kmod rsync dosfstools e2fsprogs parted >> /work/build.log 2>&1
+    # Silencing the apt installation to keep build.log clean
+    apt-get update -qq && apt-get install -y -qq kpartx curl xz-utils fdisk wget kmod rsync dosfstools e2fsprogs parted > /dev/null 2>&1
+    
     cd /work
     for i in {0..63}; do [ ! -b /dev/loop\$i ] && mknod -m 0660 /dev/loop\$i b 7 \$i || true; done
     losetup -D
@@ -109,18 +103,17 @@ docker run --rm --privileged \
     rm -rf /mnt/target/boot/*
     done_task
 
-    task 'Security & Tool Config'
+    task 'Security & crictl'
     echo 'root:root' | chroot /mnt/target chpasswd
     sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/' /mnt/target/etc/ssh/sshd_config
     cat <<EOF_CRI > /mnt/target/etc/crictl.yaml
 runtime-endpoint: unix:///run/containerd/containerd.sock
 image-endpoint: unix:///run/containerd/containerd.sock
 timeout: 10
-debug: false
 EOF_CRI
     done_task
 
-    task 'Injecting Ironclad Provisioning (v28)'
+    task 'Injecting Ironclad Provisioning (v29)'
     cat <<'EOF_PROV' > /mnt/target/usr/local/bin/rpi-provision.sh
 #!/bin/bash
 set -e
@@ -130,7 +123,8 @@ exec > >(tee -a \"\$LOG\") 2>&1
 
 log_prov() {
     local MSG=\"[\$(date +%T)] \$1\"
-    echo -e \"\033[1;32m\$MSG\033[0m\" > /dev/console
+    # Direct to TTY1 for faster HDMI visibility
+    echo -e \"\033[1;32m\$MSG\033[0m\" > /dev/tty1
     echo \"\$MSG\"
     echo -e \"\n NODE: $HOSTNAME\n STATUS: \$1\n\" > /etc/motd
 }
@@ -143,12 +137,11 @@ pacman_retry() {
         else
             if [[ \$n -lt \$max ]]; then
                 ((n++))
-                log_prov \"⚠️ Command failed. Clearing locks and retrying...\"
+                log_prov \"⚠️ Retry \$n/\$max...\"
                 rm -f /var/lib/pacman/db.lck
                 pacman -Sy >> /var/log/provision.log 2>&1 || true
                 sleep \$delay
             else
-                echo -e \"\nSTATUS: FAILED AT \$*\n\" > /etc/motd
                 exit 1
             fi
         fi
@@ -197,8 +190,8 @@ After=network.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/rpi-provision.sh
-StandardOutput=inherit
-StandardError=inherit
+StandardOutput=tty
+TTYPath=/dev/tty1
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -248,5 +241,5 @@ DURATION=$((SECONDS - START_TIME))
 log_header "BUILD COMPLETE"
 log_success "Target:    ${B_GREEN}$TARGET_IMG${NC}"
 log_success "Time:      ${B_YELLOW}$((DURATION / 60))m $((DURATION % 60))s${NC}"
-log_success "Command:   ${B_CYAN}sudo dd if=$TARGET_IMG of=/dev/diskX bs=4M status=progress${NC}"
+log_success "Command:   ${B_CYAN}sudo dd if=$TARGET_IMG of=/dev/rdiskX bs=4M status=progress${NC}"
 echo -e "\n${B_MAGENTA}=======================================================${NC}"
