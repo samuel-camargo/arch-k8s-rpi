@@ -3,10 +3,10 @@
 # Stop script on any error
 set -e
 
-# --- CONFIGURATION (Customize per node) ---
-HOSTNAME="kube-master-01"         
-PI_VERSION="5"                    # 4 or 5
-STATIC_IP="192.168.1.150/24"      
+# --- CONFIGURATION (UPDATE THESE FOR EACH RUN) ---
+HOSTNAME="kube-master-02"         # master-01, master-02, worker-01, worker-02, worker-03
+PI_VERSION="5"                    # 4 for RPi4, 5 for RPi5
+STATIC_IP="192.168.1.151/24"      # Master IPs: .150, .151 | Worker IPs: .160, .161, .162
 GATEWAY="192.168.1.1"
 WIFI_SSID="YOUR_WIFI_NAME"
 WIFI_PASS="YOUR_WIFI_PASSWORD"
@@ -36,15 +36,10 @@ cd "$WORKSPACE"
 # =========================================================
 # PHASE 1: IDEMPOTENT BASE IMAGE GENERATION (10GB)
 # =========================================================
-log_header "PHASE 1: BASE IMAGE ARCHITECTURE"
-
-if [ ! -f "$ARCH_TARBALL" ]; then
-    log_step "Downloading Arch Linux ARM Tarball..."
-    wget -c "http://os.archlinuxarm.org/os/$ARCH_TARBALL" || log_error "Failed to download Arch Tarball"
-fi
-
 if [ ! -f "$BASE_IMG" ]; then
-    log_step "Building Clean Base Image (10GB)..."
+    log_header "PHASE 1: BUILDING 10GB BASE IMAGE"
+    [ ! -f "$ARCH_TARBALL" ] && wget -q "http://os.archlinuxarm.org/os/$ARCH_TARBALL"
+    
     truncate -s 10G "$BASE_IMG"
     docker run --rm --privileged -v "$WORKSPACE":/work ubuntu:22.04 bash -c "
         export DEBIAN_FRONTEND=noninteractive
@@ -63,47 +58,34 @@ if [ ! -f "$BASE_IMG" ]; then
         mkdir -p /mnt/root/boot && mount \"/dev/mapper/\${LNAME}p1\" /mnt/root/boot
         bsdtar -xpf $ARCH_TARBALL -C /mnt/root
         sync && umount -R /mnt/root && kpartx -d \"\$LOOP_DEV\" && losetup -d \"\$LOOP_DEV\"
-    " || log_error "Base Image Build Failed"
-    echo -e "       ${B_GREEN}✔${NC} Base Image ready."
+    "
+    echo -e "       ${B_GREEN}✔${NC} Base Image Created."
 fi
 
 # =========================================================
-# PHASE 2: HARDWARE-SPECIFIC CUSTOMIZATION
+# PHASE 2: CUSTOMIZING FOR $HOSTNAME
 # =========================================================
-log_header "PHASE 2: CUSTOMIZING FOR $HOSTNAME (RPI $PI_VERSION)"
-
-log_step "Cloning and Mapping Target Image..."
+log_header "PHASE 2: CUSTOMIZING $HOSTNAME (RPi $PI_VERSION)"
 cp "$BASE_IMG" "$TARGET_IMG"
 
 docker run --rm --privileged \
-    --dns 8.8.8.8 \
-    -v "$WORKSPACE":/work \
-    -e WIFI_SSID="$WIFI_SSID" \
-    -e WIFI_PASS="$WIFI_PASS" \
-    -e REG_DOMAIN="$REG_DOMAIN" \
-    -e STATIC_IP="$STATIC_IP" \
-    -e GATEWAY="$GATEWAY" \
-    -e HOSTNAME="$HOSTNAME" \
-    -e PI_VERSION="$PI_VERSION" \
-    -e TARGET_IMG="$TARGET_IMG" \
+    --dns 8.8.8.8 -v "$WORKSPACE":/work \
+    -e WIFI_SSID="$WIFI_SSID" -e WIFI_PASS="$WIFI_PASS" -e REG_DOMAIN="$REG_DOMAIN" \
+    -e STATIC_IP="$STATIC_IP" -e GATEWAY="$GATEWAY" -e HOSTNAME="$HOSTNAME" \
+    -e PI_VERSION="$PI_VERSION" -e TARGET_IMG="$TARGET_IMG" \
     ubuntu:22.04 bash -c "
     set -e
     export DEBIAN_FRONTEND=noninteractive
-    
     task() { echo -ne \"\033[1;35m  [TASK]\033[0m \$1... \"; }
     succ() { echo -e \"\033[1;32m✔ DONE\033[0m\"; }
 
-    task 'Environment Setup'
-    apt-get update -qq > /dev/null
-    apt-get install -y -qq apt-utils > /dev/null 2>&1
-    apt-get install -y -qq kpartx curl xz-utils fdisk wget kmod rsync dosfstools e2fsprogs parted > /dev/null 2>&1
+    apt-get update -qq > /dev/null && apt-get install -y -qq apt-utils kpartx curl xz-utils fdisk wget kmod rsync dosfstools e2fsprogs parted > /dev/null 2>&1
     cd /work
-    rm -f *.pkg.tar.xz* # CLEAN SLATE: Remove stale downloads
+    rm -f *.pkg.tar.xz*
     for i in {0..63}; do [ ! -b /dev/loop\$i ] && mknod -m 0660 /dev/loop\$i b 7 \$i || true; done
     losetup -D
-    succ
-
-    task 'Mapping Partitions'
+    
+    task 'Mapping Image'
     LOOP_DEV=\$(losetup -f --show \"\$TARGET_IMG\")
     kpartx -as \"\$LOOP_DEV\"
     LNAME=\$(basename \"\$LOOP_DEV\")
@@ -112,44 +94,37 @@ docker run --rm --privileged \
     rm -rf /mnt/target/boot/*
     succ
 
-    task 'Injecting Total Provisioning'
-    cat <<'EOF_PROVISION' > /mnt/target/usr/local/bin/rpi-provision.sh
+    task 'Injecting Provisioning'
+    cat <<'EOF_PROV' > /mnt/target/usr/local/bin/rpi-provision.sh
 #!/bin/bash
 iw dev wlan0 set power_save off || true
-echo \"[PROVISION] Waiting for Internet...\"
+echo \"[PROV] Waiting for Google...\"
 while ! ping -c 1 -W 2 8.8.8.8 &>/dev/null; do sleep 3; done
-
-pacman-key --init
-pacman-key --populate archlinuxarm
+pacman-key --init && pacman-key --populate archlinuxarm
 pacman -Sy archlinux-keyring --noconfirm
 sed -i 's/#ParallelDownloads = 5/ParallelDownloads = 10/' /etc/pacman.conf
 pacman -Syu --noconfirm
-
 timedatectl set-ntp true
-swapoff -a
-sed -i '/swap/d' /etc/fstab
-
+swapoff -a && sed -i '/swap/d' /etc/fstab
 pacman -S --noconfirm containerd kubeadm kubelet kubectl runc
 mkdir -p /etc/containerd
 containerd config default > /etc/containerd/config.toml
 sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
 systemctl enable --now containerd kubelet
-
 ROOT_DEV=\$(findmnt / -o SOURCE -n)
 DISK_DEV=\${ROOT_DEV%p*}
 PART_NUM=\$(echo \$ROOT_DEV | grep -o '[0-9]\$')
 echo -e \"d\n\$PART_NUM\nn\np\n\$PART_NUM\n\n\ny\nw\" | fdisk \$DISK_DEV > /dev/null 2>&1
 partx -u \$DISK_DEV || true
 resize2fs \$ROOT_DEV > /dev/null 2>&1
-
 systemctl disable rpi-provision.service
 rm /etc/systemd/system/rpi-provision.service
-EOF_PROVISION
+EOF_PROV
     chmod +x /mnt/target/usr/local/bin/rpi-provision.sh
     
     cat <<EOF > /mnt/target/etc/systemd/system/rpi-provision.service
 [Unit]
-Description=Full K8s Node Provisioning
+Description=K8s Provisioning
 After=network-online.target
 [Service]
 Type=oneshot
@@ -160,7 +135,7 @@ EOF
     ln -sf /etc/systemd/system/rpi-provision.service /mnt/target/etc/systemd/system/multi-user.target.wants/rpi-provision.service
     succ
 
-    task \"Finding Drivers for RPi \$PI_VERSION\"
+    task \"Patching Drivers for RPi \$PI_VERSION\"
     K_MIRROR=\"http://fl.us.mirror.archlinuxarm.org/aarch64\"
     if [ \"\$PI_VERSION\" == \"4\" ]; then
         KERNEL_PKG=\$(curl -sL \$K_MIRROR/core/ | grep -oE 'linux-rpi-[0-9][^[:space:]\"]+\.pkg\.tar\.xz' | grep -v '16k' | grep -v 'headers' | sort -V | tail -n 1)
@@ -172,22 +147,17 @@ EOF
     REGDB=\$(curl -sL \$K_MIRROR/core/ | grep -oE 'wireless-regdb-[^[:space:]\"]+\.pkg\.tar\.xz' | sort -V | tail -n 1)
     BOOT=\$(curl -sL \$K_MIRROR/alarm/ | grep -oE 'raspberrypi-bootloader-[^[:space:]\"]+\.pkg\.tar\.xz' | sort -V | tail -n 1)
     FIRM=\$(curl -sL \$K_MIRROR/alarm/ | grep -oE 'firmware-raspberrypi-[^[:space:]\"]+\.pkg\.tar\.xz' | sort -V | tail -n 1)
-    succ
 
-    task 'Downloading and Extracting Kernel'
     wget -q \"\$K_MIRROR/core/\$KERNEL_PKG\" \"\$K_MIRROR/core/\$REGDB\" \"\$K_MIRROR/alarm/\$BOOT\" \"\$K_MIRROR/alarm/\$FIRM\"
-    
-    # Explicit filenames for tar to prevent duplicate file suffix errors
     tar -xpf \"\$KERNEL_PKG\" -C /mnt/target
-    tar -xpf \"\$REGDB\" -C /mnt/target
-    tar -xpf \"\$BOOT\" -C /mnt/target
-    tar -xpf \"\$FIRM\" -C /mnt/target
-    
+    tar -xpf \"wireless-regdb\"* -C /mnt/target
+    tar -xpf \"raspberrypi-bootloader\"* -C /mnt/target
+    tar -xpf \"firmware-raspberrypi\"* -C /mnt/target
     [ -d /mnt/target/boot/boot ] && mv /mnt/target/boot/boot/* /mnt/target/boot/ && rmdir /mnt/target/boot/boot
     depmod -b /mnt/target \$(ls /mnt/target/usr/lib/modules | head -n 1)
     succ
 
-    task 'Finalizing Configuration'
+    task 'Finalizing Setup'
     echo \"\$HOSTNAME\" > /mnt/target/etc/hostname
     cat <<EOF > /mnt/target/etc/systemd/network/25-wireless.network
 [Match]
@@ -198,20 +168,18 @@ Gateway=\$GATEWAY
 DNS=1.1.1.1
 EOF
     mkdir -p /mnt/target/etc/modprobe.d
-    echo \"options brcmfmac roamoff=1 ccode=\$REG_DOMAIN\" > /mnt/target/etc/modprobe.d/brcmfmac.conf
+    echo \"options brcmfmac roamoff=1 feature_disable=0x82000 ccode=\$REG_DOMAIN\" > /mnt/target/etc/modprobe.d/brcmfmac.conf
     printf \"country=\$REG_DOMAIN\nctrl_interface=/var/run/wpa_supplicant\nupdate_config=1\np2p_disabled=1\n\nnetwork={\n    ssid=\\\"\$WIFI_SSID\\\"\n    psk=\\\"\$WIFI_PASS\\\"\n    key_mgmt=WPA-PSK\n    ieee80211w=1\n}\n\" > /mnt/target/etc/wpa_supplicant/wpa_supplicant-wlan0.conf
-    
     ln -sf /usr/lib/systemd/system/wpa_supplicant@.service /mnt/target/etc/systemd/system/multi-user.target.wants/wpa_supplicant@wlan0.service
     ln -sf /usr/lib/systemd/system/systemd-networkd.service /mnt/target/etc/systemd/system/multi-user.target.wants/systemd-networkd.service
     sed -i 's/^root:[^:]*:/root::/' /mnt/target/etc/shadow
     echo -e \"arm_64bit=1\nkernel=Image\ndevice_tree=\$DTB\nusb_max_current_enable=1\" > /mnt/target/boot/config.txt
     echo \"root=/dev/mmcblk0p2 rw rootwait console=tty1 selinux=0 net.ifnames=0 ipv6.disable=1 cgroup_enable=cpuset cgroup_enable=memory cgroup_memory=1 cfg80211.regdom=\$REG_DOMAIN\" > /mnt/target/boot/cmdline.txt
-    
     sync && umount -R /mnt/target && kpartx -d \"\$LOOP_DEV\" && losetup -d \"\$LOOP_DEV\"
     succ
-" || log_error "Customization Phase Failed"
+" || log_error "Customization Failed"
 
-log_header "SUCCESS: READY TO FLASH"
-echo -e "Node:     ${B_GREEN}$HOSTNAME${NC}"
+log_header "SUCCESS: READY TO FLASH $HOSTNAME"
+echo -e "IP:       ${B_GREEN}$STATIC_IP${NC}"
 echo -e "Flash:    ${B_CYAN}sudo dd if=$TARGET_IMG of=/dev/diskX bs=4M status=progress${NC}"
 log_header "========================================"
