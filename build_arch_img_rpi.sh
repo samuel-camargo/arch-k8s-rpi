@@ -4,9 +4,9 @@
 set -e
 
 # --- CONFIGURATION (UPDATE THESE FOR EACH NODE) ---
-HOSTNAME="kube-worker-03"
-PI_VERSION="4"
-STATIC_IP="192.168.1.162/24"
+HOSTNAME="kube-worker-03"         # master-01, master-02, worker-01, worker-02, worker-03
+PI_VERSION="4"                    # 4 for RPi4, 5 for RPi5
+STATIC_IP="192.168.1.162/24"      # IPs: .150 (M1), .151 (M2), .160 (W1), .161 (W2), .162 (W3)
 GATEWAY="192.168.1.1"
 WIFI_SSID="YOUR_WIFI_NAME"
 WIFI_PASS="YOUR_WIFI_PASSWORD"
@@ -27,7 +27,6 @@ B_YELLOW='\033[1;33m'
 B_RED='\033[1;31m'
 NC='\033[0m'
 
-# Track time
 START_TIME=$SECONDS
 
 log_header() { echo -e "\n${B_MAGENTA}🚀 [$(date +%T)] ==================== $1 ====================${NC}"; }
@@ -41,7 +40,7 @@ echo "--- Build Log Started $(date) ---" > "$LOG_FILE"
 cd "$WORKSPACE"
 
 # =========================================================
-# PRE-FLIGHT SUMMARY
+# PRE-FLIGHT CHECK
 # =========================================================
 log_header "PRE-FLIGHT CHECK"
 echo -e "  Target Host: ${B_GREEN}$HOSTNAME${NC}"
@@ -103,10 +102,10 @@ docker run --rm --privileged \
     set -e
     export DEBIAN_FRONTEND=noninteractive
     
-    # Internal Task Logger
     task() { echo -ne \"\033[1;36m  [⏳]\033[0m \$1... \"; }
     done_task() { echo -e \"\033[1;32mDONE\033[0m\"; }
 
+    # Squelch noisy setup
     apt-get update -qq >> /work/build.log 2>&1 && apt-get install -y -qq apt-utils kpartx curl xz-utils fdisk wget kmod rsync dosfstools e2fsprogs parted >> /work/build.log 2>&1
     cd /work
     rm -f *.pkg.tar.xz*
@@ -117,8 +116,17 @@ docker run --rm --privileged \
     LOOP_DEV=\$(losetup -f --show \"\$TARGET_IMG\")
     kpartx -as \"\$LOOP_DEV\"
     LNAME=\$(basename \"\$LOOP_DEV\")
-    mkdir -p /mnt/target && mount \"/dev/mapper/\${LNAME}p2\" /mnt/target
-    mkdir -p /mnt/target/boot && mount \"\$MAP_BOOT\" /mnt/target/boot >> /work/build.log 2>&1 || mount \"/dev/mapper/\${LNAME}p1\" /mnt/target/boot
+    
+    # BREADCRUMB: Export mapper paths for visibility
+    MAP_BOOT=\"/dev/mapper/\${LNAME}p1\"
+    MAP_ROOT=\"/dev/mapper/\${LNAME}p2\"
+    echo \"[DEBUG] Mapper Boot: \$MAP_BOOT\" >> /work/build.log
+    
+    # CRITICAL: Settle time for Docker-on-Mac storage sync
+    sleep 3
+    
+    mkdir -p /mnt/target && mount \"\$MAP_ROOT\" /mnt/target
+    mkdir -p /mnt/target/boot && mount \"\$MAP_BOOT\" /mnt/target/boot
     rm -rf /mnt/target/boot/*
     done_task
 
@@ -135,15 +143,14 @@ timedatectl set-ntp true
 swapoff -a && sed -i '/swap/d' /etc/fstab
 mkdir -p /etc/modules-load.d && echo -e \"overlay\nbr_netfilter\" > /etc/modules-load.d/k8s.conf
 modprobe overlay || true && modprobe br_netfilter || true
-cat <<EOF > /etc/sysctl.d/k8s.conf
+cat <<EOF_SYS > /etc/sysctl.d/k8s.conf
 net.bridge.bridge-nf-call-iptables  = 1
 net.bridge.bridge-nf-call-ip6tables = 1
 net.ipv4.ip_forward                 = 1
-EOF
+EOF_SYS
 sysctl --system
 pacman -S --noconfirm containerd kubeadm kubelet kubectl runc
-mkdir -p /etc/containerd
-containerd config default > /etc/containerd/config.toml
+mkdir -p /etc/containerd && containerd config default > /etc/containerd/config.toml
 sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
 systemctl enable --now containerd kubelet
 ROOT_DEV=\$(findmnt / -o SOURCE -n)
@@ -152,6 +159,7 @@ partx -u \${ROOT_DEV%p*} || true && resize2fs \$ROOT_DEV > /dev/null 2>&1
 systemctl disable rpi-provision.service && rm /etc/systemd/system/rpi-provision.service
 EOF_PROV
     chmod +x /mnt/target/usr/local/bin/rpi-provision.sh
+    
     cat <<EOF > /mnt/target/etc/systemd/system/rpi-provision.service
 [Unit]
 Description=K8s Provision
@@ -178,18 +186,17 @@ EOF
     BOOT=\$(curl -sL \$K_MIRROR/alarm/ | grep -oE 'raspberrypi-bootloader-[^[:space:]\"]+\.pkg\.tar\.xz' | tail -n 1)
     FIRM=\$(curl -sL \$K_MIRROR/alarm/ | grep -oE 'firmware-raspberrypi-[^[:space:]\"]+\.pkg\.tar\.xz' | tail -n 1)
     wget -q \"\$K_MIRROR/core/\$K_PKG\" \"\$K_MIRROR/core/\$REG\" \"\$K_MIRROR/alarm/\$BOOT\" \"\$K_MIRROR/alarm/\$FIRM\"
+    echo \"[INFO] Package: \$K_PKG\" >> /work/build.log
     done_task
 
-    task 'Extracting Image'
+    task 'Extracting & Finalizing'
     tar -xpf \"\$K_PKG\" -C /mnt/target >> /work/build.log 2>&1
     tar -xpf \"\$REG\" -C /mnt/target >> /work/build.log 2>&1
     tar -xpf \"\$BOOT\" -C /mnt/target >> /work/build.log 2>&1
     tar -xpf \"\$FIRM\" -C /mnt/target >> /work/build.log 2>&1
     [ -d /mnt/target/boot/boot ] && mv /mnt/target/boot/boot/* /mnt/target/boot/ && rmdir /mnt/target/boot/boot
     depmod -b /mnt/target \$(ls /mnt/target/usr/lib/modules | head -n 1)
-    done_task
-
-    task 'Finalizing'
+    
     echo \"\$HOSTNAME\" > /mnt/target/etc/hostname
     cat <<EOF > /mnt/target/etc/systemd/network/25-wireless.network
 [Match]
@@ -207,9 +214,10 @@ EOF
     sed -i 's/^root:[^:]*:/root::/' /mnt/target/etc/shadow
     echo -e \"arm_64bit=1\nkernel=Image\ndevice_tree=\$DTB\nusb_max_current_enable=1\" > /mnt/target/boot/config.txt
     echo \"root=/dev/mmcblk0p2 rw rootwait console=tty1 selinux=0 net.ifnames=0 ipv6.disable=1 cgroup_enable=cpuset cgroup_enable=memory cgroup_memory=1 cfg80211.regdom=\$REG_DOMAIN\" > /mnt/target/boot/cmdline.txt
+    
     sync && umount -R /mnt/target && kpartx -d \"\$LOOP_DEV\" >> /work/build.log 2>&1 && losetup -d \"\$LOOP_DEV\"
     done_task
-" || log_error "Check $LOG_FILE for details."
+" || log_error "Build failed."
 
 # =========================================================
 # FINAL SUMMARY
