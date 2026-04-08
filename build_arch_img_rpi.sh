@@ -9,7 +9,7 @@ BASE_IMG="rpi_arch_base.img"
 RPI5_IMG="rpi5_master.img"
 MIRROR="http://mirror.archlinuxarm.org/aarch64/alarm"
 
-# Colors
+# Colors for logging
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
@@ -25,13 +25,15 @@ cd "$WORKSPACE"
 
 log "Step 1: Cloning Base Image for RPi 5"
 if [ ! -f "$BASE_IMG" ]; then
-    error_exit "Base image $BASE_IMG not found!"
+    error_exit "Base image $BASE_IMG not found! Run the first script to create the base image first."
 fi
 
+# Idempotent copy
 cp "$BASE_IMG" "$RPI5_IMG"
 log "Cloned $BASE_IMG to $RPI5_IMG."
 
 log "Step 2: Launching Docker for Offline Injection"
+# Using --dns 8.8.8.8 to ensure the container can resolve the mirror
 docker run --rm --privileged \
     --dns 8.8.8.8 \
     -v "$WORKSPACE":/work \
@@ -44,27 +46,22 @@ docker run --rm --privileged \
 
     cd /work
     
-    echo 'Discovering latest RPi 5 packages...'
-    # Scrape the mirror - simplified to just look for filenames ending in .zst
+    echo 'Discovering latest RPi 5 packages from mirror...'
     HTML_LIST=\$(curl -sL $MIRROR/)
     
-    # New discovery logic: 
-    # 1. Finds all text inside href=\"...\"
-    # 2. Filters by the specific package name
-    # 3. Sorts and picks the latest
+    # Discovery logic: captures the filename ending in .zst
     KERNEL_PKG=\$(echo \"\$HTML_LIST\" | grep -oE 'linux-rpi-[^[:space:]\"]+\.pkg\.tar\.zst' | sort -V | tail -n 1)
     BOOT_PKG=\$(echo \"\$HTML_LIST\" | grep -oE 'raspberrypi-bootloader-[^[:space:]\"]+\.pkg\.tar\.zst' | sort -V | tail -n 1)
     FIRM_PKG=\$(echo \"\$HTML_LIST\" | grep -oE 'raspberrypi-firmware-[^[:space:]\"]+\.pkg\.tar\.zst' | sort -V | tail -n 1)
 
+    if [ -z \"\$KERNEL_PKG\" ] || [ -z \"\$BOOT_PKG\" ] || [ -z \"\$FIRM_PKG\" ]; then
+        echo 'ERROR: Discovery failed. Could not find packages on mirror.'
+        exit 1
+    fi
+
     echo \"Found Kernel: \$KERNEL_PKG\"
     echo \"Found Bootloader: \$BOOT_PKG\"
     echo \"Found Firmware: \$FIRM_PKG\"
-
-    # Validation: Stop if discovery failed
-    if [ -z \"\$KERNEL_PKG\" ] || [ -z \"\$BOOT_PKG\" ] || [ -z \"\$FIRM_PKG\" ]; then
-        echo 'ERROR: Discovery failed. The mirror format might have changed.'
-        exit 1
-    fi
 
     PKGS=(\"\$KERNEL_PKG\" \"\$BOOT_PKG\" \"\$FIRM_PKG\")
     for pkg in \"\${PKGS[@]}\"; do
@@ -95,15 +92,19 @@ docker run --rm --privileged \
         tar --zstd -xpf \"\$pkg\" -C /mnt/root --exclude='.PKGINFO' --exclude='.MTREE' --exclude='.INSTALL'
     done
 
-    # --- Headless Config (SSH/Root) ---
-    echo 'Enabling Headless Access...'
+    echo 'Enabling Headless Access (SSH/Root)...'
+    # Enable sshd service
     ln -sf /usr/lib/systemd/system/sshd.service /mnt/root/etc/systemd/system/multi-user.target.wants/sshd.service
+    # Permit root login
     sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /mnt/root/etc/ssh/sshd_config
     
-    # Inject SSH key for root if it exists in the work dir
+    # Inject SSH key if provided in workspace
     mkdir -p /mnt/root/root/.ssh && chmod 700 /mnt/root/root/.ssh
-    [ -f /work/id_rsa.pub ] && cp /work/id_rsa.pub /mnt/root/root/.ssh/authorized_keys
-    [ -f /work/id_ed25519.pub ] && cp /work/id_ed25519.pub /mnt/root/root/.ssh/authorized_keys
+    if [ -f /work/id_rsa.pub ]; then
+        cp /work/id_rsa.pub /mnt/root/root/.ssh/authorized_keys
+    elif [ -f /work/id_ed25519.pub ]; then
+        cp /work/id_ed25519.pub /mnt/root/root/.ssh/authorized_keys
+    fi
     [ -f /mnt/root/root/.ssh/authorized_keys ] && chmod 600 /mnt/root/root/.ssh/authorized_keys
 
     echo 'Finalizing boot files...'
