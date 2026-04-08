@@ -31,6 +31,7 @@ START_TIME=$SECONDS
 log_header() { echo -e "\n${B_MAGENTA}🚀 [$(date +%T)] ==================== $1 ====================${NC}"; }
 log_step()   { echo -e "${B_CYAN}[⭐]${NC} $1"; }
 log_success(){ echo -e "     ${B_GREEN}✔${NC} $1"; }
+log_info()   { echo -e "     ${B_YELLOW}i${NC} $1"; }
 log_error()  { echo -e "${B_RED}[💥 ERROR]${NC} $1\nCheck $LOG_FILE for details."; exit 1; }
 
 mkdir -p "$WORKSPACE"
@@ -38,12 +39,21 @@ echo "--- Build Log Started $(date) ---" > "$LOG_FILE"
 cd "$WORKSPACE"
 
 # =========================================================
-# PHASE 1: BASE IMAGE GENERATION
+# PHASE 1: BASE IMAGE VERIFICATION
 # =========================================================
+log_header "PHASE 1: BASE ARCHITECTURE"
+
+# Check Tarball
+if [ ! -f "$ARCH_TARBALL" ]; then
+    log_step "Arch Linux ARM Tarball missing. Downloading..."
+    wget -c -O "$ARCH_TARBALL" "http://os.archlinuxarm.org/os/$ARCH_TARBALL" >> "$LOG_FILE" 2>&1
+else
+    log_success "Tarball found ($ARCH_TARBALL). Skipping download."
+fi
+
+# Check/Build Base Image
 if [ ! -f "$BASE_IMG" ]; then
-    log_header "PHASE 1: BASE ARCHITECTURE"
-    [ ! -f "$ARCH_TARBALL" ] && wget -c -O "$ARCH_TARBALL" "http://os.archlinuxarm.org/os/$ARCH_TARBALL" >> "$LOG_FILE" 2>&1
-    
+    log_step "Base Image missing. Building 10GB Arch-Base..."
     truncate -s 10G "$BASE_IMG"
     docker run --rm --privileged -v "$WORKSPACE":/work ubuntu:22.04 bash -c "
         export DEBIAN_FRONTEND=noninteractive
@@ -62,12 +72,16 @@ if [ ! -f "$BASE_IMG" ]; then
         bsdtar -xpf $ARCH_TARBALL -C /mnt/root
         sync && umount -R /mnt/root && kpartx -d \"\$LOOP\" && losetup -d \"\$LOOP\"
     " || log_error "Base build failed."
+    log_success "Base image generated successfully."
+else
+    log_success "Existing base image found ($BASE_IMG). Reusing."
 fi
 
 # =========================================================
 # PHASE 2: CUSTOMIZATION
 # =========================================================
 log_header "PHASE 2: KUBE-NODE HARDENING"
+log_step "Cloning base image to $TARGET_IMG..."
 cp "$BASE_IMG" "$TARGET_IMG"
 
 docker run --rm --privileged \
@@ -106,7 +120,7 @@ debug: false
 EOF_CRI
     done_task
 
-    task 'Injecting Ironclad Provisioning (v27)'
+    task 'Injecting Ironclad Provisioning (v28)'
     cat <<'EOF_PROV' > /mnt/target/usr/local/bin/rpi-provision.sh
 #!/bin/bash
 set -e
