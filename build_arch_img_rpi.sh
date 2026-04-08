@@ -91,7 +91,7 @@ docker run --rm --privileged \
     rm -rf /mnt/target/boot/*
     done_task
 
-    task 'Enabling Root SSH & Tool Configs'
+    task 'Enabling Root SSH & crictl config'
     sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/' /mnt/target/etc/ssh/sshd_config
     echo 'root:root' | chroot /mnt/target chpasswd
     cat <<EOF_CRI > /mnt/target/etc/crictl.yaml
@@ -102,7 +102,7 @@ debug: false
 EOF_CRI
     done_task
 
-    task 'Injecting Ultimate Provisioning (v24)'
+    task 'Injecting Ironclad Provisioning (v25)'
     cat <<'EOF_PROV' > /mnt/target/usr/local/bin/rpi-provision.sh
 #!/bin/bash
 set -e
@@ -121,15 +121,19 @@ log_prov() {
 pacman_retry() {
     local n=1; local max=5; local delay=10
     while true; do
-        if yes | \"\$@\"; then break;
+        log_prov \"🎬 Executing: \$*\"
+        if yes | \"\$@\" >> /var/log/provision.log 2>&1; then
+            break
         else
             if [[ \$n -lt \$max ]]; then
                 ((n++))
-                log_prov \"⚠️ Mirror Timeout. Retrying (\$n/\$max)...\"
+                log_prov \"⚠️ Command failed. Clearing locks and retrying...\"
+                rm -f /var/lib/pacman/db.lck
+                pacman -Sy >> /var/log/provision.log 2>&1 || true
                 sleep \$delay
-                pacman -Syy
             else
-                log_prov \"❌ FATAL ERROR: Mirror failure.\"
+                log_prov \"❌ FATAL ERROR: Mirror failure after \$max attempts.\"
+                echo -e \"\nSTATUS: FAILED at Step: \$*\nCheck /var/log/provision.log\n\" > /etc/motd
                 exit 1
             fi
         fi
@@ -152,7 +156,7 @@ pacman_retry pacman -Syu --noconfirm
 timedatectl set-ntp true
 swapoff -a && sed -i '/swap/d' /etc/fstab
 
-log_prov \"⚙️ (Step 4/7) Configuring Kernel Modules...\"
+log_prov \"⚙️ (Step 4/7) Loading K8s Modules...\"
 mkdir -p /etc/modules-load.d && echo -e \"overlay\nbr_netfilter\" > /etc/modules-load.d/k8s.conf
 modprobe overlay || true && modprobe br_netfilter || true
 cat <<EOF_SYS > /etc/sysctl.d/k8s.conf
@@ -162,19 +166,18 @@ net.ipv4.ip_forward                 = 1
 EOF_SYS
 sysctl --system
 
-log_prov \"🏗️ (Step 5/7) Installing K8s & Storage Tools...\"
-# Added open-iscsi and nfs-utils for Longhorn
+log_prov \"🏗️ (Step 5/7) Installing K8s & Longhorn Tools...\"
 pacman_retry pacman -S --noconfirm containerd kubeadm kubelet kubectl runc open-iscsi nfs-utils
 mkdir -p /etc/containerd && containerd config default > /etc/containerd/config.toml
 sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
 systemctl enable --now containerd kubelet iscsid
 
-log_prov \"💾 (Step 6/7) Expanding Filesystem...\"
+log_prov \"💾 (Step 6/7) Finalizing Disk...\"
 ROOT_DEV=\$(findmnt / -o SOURCE -n)
 echo -e \"d\n2\nn\np\n2\n\n\ny\nw\" | fdisk \${ROOT_DEV%p*} > /dev/null 2>&1
 partx -u \${ROOT_DEV%p*} || true && resize2fs \$ROOT_DEV > /dev/null 2>&1
 
-log_prov \"✅ (Step 7/7) COMPLETE! Node is Ready.\"
+log_prov \"✅ (Step 7/7) COMPLETE! Cluster Node Ready.\"
 echo -e \"\nStatus: PROVISIONED / READY\n\" > /etc/motd
 systemctl disable rpi-provision.service && rm /etc/systemd/system/rpi-provision.service
 EOF_PROV
@@ -182,7 +185,7 @@ EOF_PROV
 
     cat <<EOF > /mnt/target/etc/systemd/system/rpi-provision.service
 [Unit]
-Description=Robust K8s Provision
+Description=Ironclad K8s Provision
 After=network-online.target
 Wants=network-online.target
 [Service]
