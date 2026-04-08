@@ -1,6 +1,5 @@
 #!/bin/bash
 
-# Exit on error
 set -e
 
 # --- Configuration ---
@@ -25,13 +24,12 @@ trap 'echo -e "${RED}Script interrupted or failed unexpectedly.${NC}"' ERR
 mkdir -p "$WORKSPACE"
 cd "$WORKSPACE"
 
-log "Step 1: Cloning Base Image for RPi 5"
+log "Step 1: Cloning Base Image"
 if [ ! -f "$BASE_IMG" ]; then
-    error_exit "Base image $BASE_IMG not found! Ensure build_arch_img.sh (10GB version) ran first."
+    error_exit "Base image $BASE_IMG not found!"
 fi
 
 cp "$BASE_IMG" "$RPI5_IMG"
-log "Cloned base image."
 
 log "Step 2: Launching Docker for Injection"
 docker run --rm --privileged \
@@ -41,23 +39,23 @@ docker run --rm --privileged \
     set -e
     export DEBIAN_FRONTEND=noninteractive
     
-    echo 'Installing system dependencies...'
     apt-get update -qq && apt-get install -y -qq kpartx wget zstd xz-utils fdisk dosfstools e2fsprogs curl > /dev/null
 
     cd /work
     
-    echo 'Fixing loop nodes...'
+    # Create loop nodes
     for i in {0..15}; do [ ! -b /dev/loop\$i ] && mknod /dev/loop\$i b 7 \$i || true; done
 
     echo 'Fetching mirror indexes...'
     CORE_LIST=\$(curl -sL $MIRROR_CORE/)
     ALARM_LIST=\$(curl -sL $MIRROR_ALARM/)
     
-    KERNEL_PKG=\$(echo \"\$CORE_LIST\" | grep -oE 'linux-rpi-[0-9][^[:space:]\"]+\.pkg\.tar\.xz' | grep -v 'headers' | sort -V | tail -n 1)
+    # SWITCHED: Using linux-rpi (4k) instead of 16k for maximum driver compatibility
+    KERNEL_PKG=\$(echo \"\$CORE_LIST\" | grep -oE 'linux-rpi-[0-9][^[:space:]\"]+\.pkg\.tar\.xz' | grep -v 'headers' | grep -v '16k' | sort -V | tail -n 1)
     BOOT_PKG=\$(echo \"\$ALARM_LIST\" | grep -oE 'raspberrypi-bootloader-[^[:space:]\"]+\.pkg\.tar\.xz' | sort -V | tail -n 1)
     FIRM_PKG=\$(echo \"\$ALARM_LIST\" | grep -oE 'firmware-raspberrypi-[^[:space:]\"]+\.pkg\.tar\.xz' | sort -V | tail -n 1)
 
-    echo \"Found Kernel: \$KERNEL_PKG\"
+    echo \"Found Kernel (4k): \$KERNEL_PKG\"
     echo \"Found Bootloader: \$BOOT_PKG\"
     echo \"Found Firmware: \$FIRM_PKG\"
 
@@ -65,7 +63,6 @@ docker run --rm --privileged \
     [ ! -f \"\$BOOT_PKG\" ] && wget -q --show-progress \"$MIRROR_ALARM/\$BOOT_PKG\"
     [ ! -f \"\$FIRM_PKG\" ] && wget -q --show-progress \"$MIRROR_ALARM/\$FIRM_PKG\"
 
-    echo 'Mapping image partitions...'
     kpartx -d $RPI5_IMG || true
     KOUT=\$(kpartx -asv $RPI5_IMG)
     BOOT_MAPPER=\$(echo \"\$KOUT\" | grep 'p1 ' | awk '{print \$3}')
@@ -76,64 +73,57 @@ docker run --rm --privileged \
     mkdir -p /mnt/root/boot
     mount \"/dev/mapper/\$BOOT_MAPPER\" /mnt/root/boot
 
-    echo 'CLEANUP: Removing generic modules...'
+    echo 'CLEANUP: Purging old modules/boot files...'
     rm -rf /mnt/root/usr/lib/modules/*
     rm -rf /mnt/root/boot/*
 
-    echo 'Injecting RPi 5 Kernel and Firmware...'
+    echo 'Injecting Files...'
     PKGS=(\"\$KERNEL_PKG\" \"\$BOOT_PKG\" \"\$FIRM_PKG\")
     for pkg in \"\${PKGS[@]}\"; do
-        echo \"Extracting \$pkg...\"
         tar -xpf \"\$pkg\" -C /mnt/root --exclude='.PKGINFO' --exclude='.MTREE' --exclude='.INSTALL'
     done
 
-    echo 'SURGERY: Fixing Boot partition directory structure...'
-    # Arch packages put files in /boot/. Since we mounted P1 to /boot, 
-    # the files end up in /boot/boot/. We must move them to the top level.
     if [ -d /mnt/root/boot/boot ]; then
         mv /mnt/root/boot/boot/* /mnt/root/boot/
         rmdir /mnt/root/boot/boot
     fi
 
-    echo 'Configuring config.txt for RPi 5 USB support...'
-    # Basic Pi 5 configuration
+    echo 'Configuring config.txt with RP1 USB Fixes...'
     cat <<EOF > /mnt/root/boot/config.txt
-# Raspberry Pi 5 Arch Linux ARM Config
+# RPi 5 Arch Linux Config (4k Kernel)
 arm_64bit=1
 enable_uart=1
-uart_2ndstage=1
 
-# Use the RPi kernel we injected
+# Use the standard kernel
 kernel=Image
 
-# Required for RPi 5 USB (RP1 chip)
+# RPi 5 Hardware Identity
 device_tree=bcm2712-rpi-5-b.dtb
 overlay_prefix=overlays/
 
-# Enable common features
+# USB/RP1 Fixes
+# Force high current mode for USB
+usb_max_current_enable=1
+# Ensure the RP1 chip initializes correctly
+dtparam=pcie_aspm=off
+
+# General features
 dtparam=audio=on
-dtoverlay=vc4-kms-v3d
+dtoverlay=vc4-kms-v3d-pi5
 max_framebuffers=2
 EOF
 
-    echo 'Configuring cmdline.txt...'
-    # rootwait is vital for SD cards
-    echo 'root=/dev/mmcblk0p2 rw rootwait console=serial0,115200 console=tty1 selinux=0 smsc95xx.turbo_mode=N' > /mnt/root/boot/cmdline.txt
+    echo 'root=/dev/mmcblk0p2 rw rootwait console=serial0,115200 console=tty1 selinux=0 smsc95xx.turbo_mode=N dwc_otg.lpm_enable=0' > /mnt/root/boot/cmdline.txt
 
-    echo 'Setting up Headless Access...'
+    # Headless Access
     ln -sf /usr/lib/systemd/system/sshd.service /mnt/root/etc/systemd/system/multi-user.target.wants/sshd.service
     sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /mnt/root/etc/ssh/sshd_config
     mkdir -p /mnt/root/root/.ssh && chmod 700 /mnt/root/root/.ssh
-    if [ -f /work/id_rsa.pub ]; then cp /work/id_rsa.pub /mnt/root/root/.ssh/authorized_keys
-    elif [ -f /work/id_ed25519.pub ]; then cp /work/id_ed25519.pub /mnt/root/root/.ssh/authorized_keys
-    fi
+    if [ -f /work/id_rsa.pub ]; then cp /work/id_rsa.pub /mnt/root/root/.ssh/authorized_keys; fi
     [ -f /mnt/root/root/.ssh/authorized_keys ] && chmod 600 /mnt/root/root/.ssh/authorized_keys
 
-    echo 'Finalizing fstab...'
-    cat <<EOF > /mnt/root/etc/fstab
-/dev/mmcblk0p1  /boot   vfat    defaults        0       0
-/dev/mmcblk0p2  /       ext4    defaults,noatime  0       1
-EOF
+    echo '/dev/mmcblk0p1  /boot   vfat    defaults        0       0' > /mnt/root/etc/fstab
+    echo '/dev/mmcblk0p2  /       ext4    defaults,noatime  0       1' >> /mnt/root/etc/fstab
 
     sync
     umount -R /mnt/root
@@ -141,4 +131,4 @@ EOF
     echo 'Done.'
 "
 
-log "${GREEN}--- SUCCESS: RPi 5 Master Image is Ready ---${NC}"
+log "${GREEN}--- SUCCESS: Compatibility RPi 5 Image Ready ---${NC}"
