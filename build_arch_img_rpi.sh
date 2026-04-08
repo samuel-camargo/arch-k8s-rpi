@@ -7,9 +7,11 @@ set -e
 WORKSPACE="$HOME/rpi_arch_build"
 BASE_IMG="rpi_arch_base.img"
 RPI5_IMG="rpi5_master.img"
-MIRROR="http://mirror.archlinuxarm.org/aarch64/alarm"
 
-# Colors for logging
+# Updated to use your Florida mirror, specifically the 'alarm' repo for kernels
+MIRROR_BASE="http://fl.us.mirror.archlinuxarm.org/aarch64/alarm"
+
+# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
@@ -25,15 +27,13 @@ cd "$WORKSPACE"
 
 log "Step 1: Cloning Base Image for RPi 5"
 if [ ! -f "$BASE_IMG" ]; then
-    error_exit "Base image $BASE_IMG not found! Run the first script to create the base image first."
+    error_exit "Base image $BASE_IMG not found! Please ensure build_arch_img.sh ran successfully."
 fi
 
-# Idempotent copy
 cp "$BASE_IMG" "$RPI5_IMG"
 log "Cloned $BASE_IMG to $RPI5_IMG."
 
 log "Step 2: Launching Docker for Offline Injection"
-# Using --dns 8.8.8.8 to ensure the container can resolve the mirror
 docker run --rm --privileged \
     --dns 8.8.8.8 \
     -v "$WORKSPACE":/work \
@@ -46,16 +46,20 @@ docker run --rm --privileged \
 
     cd /work
     
-    echo 'Discovering latest RPi 5 packages from mirror...'
-    HTML_LIST=\$(curl -sL $MIRROR/)
+    echo 'Discovering latest RPi 5 packages from Florida mirror...'
+    HTML_LIST=\$(curl -sL $MIRROR_BASE/)
     
-    # Discovery logic: captures the filename ending in .zst
-    KERNEL_PKG=\$(echo \"\$HTML_LIST\" | grep -oE 'linux-rpi-[^[:space:]\"]+\.pkg\.tar\.zst' | sort -V | tail -n 1)
-    BOOT_PKG=\$(echo \"\$HTML_LIST\" | grep -oE 'raspberrypi-bootloader-[^[:space:]\"]+\.pkg\.tar\.zst' | sort -V | tail -n 1)
-    FIRM_PKG=\$(echo \"\$HTML_LIST\" | grep -oE 'raspberrypi-firmware-[^[:space:]\"]+\.pkg\.tar\.zst' | sort -V | tail -n 1)
+    # Discovery logic: Handles .zst and the .xz files you found
+    GET_PKG() {
+        echo \"\$HTML_LIST\" | grep -oE \"\$1-[0-9][^[:space:]\\\">]+\.pkg\.tar\.(zst|xz)\" | sort -V | tail -n 1
+    }
+
+    KERNEL_PKG=\$(GET_PKG \"linux-rpi\")
+    BOOT_PKG=\$(GET_PKG \"raspberrypi-bootloader\")
+    FIRM_PKG=\$(GET_PKG \"raspberrypi-firmware\")
 
     if [ -z \"\$KERNEL_PKG\" ] || [ -z \"\$BOOT_PKG\" ] || [ -z \"\$FIRM_PKG\" ]; then
-        echo 'ERROR: Discovery failed. Could not find packages on mirror.'
+        echo 'ERROR: Could not find RPi 5 packages in /alarm/ directory of the mirror.'
         exit 1
     fi
 
@@ -67,16 +71,15 @@ docker run --rm --privileged \
     for pkg in \"\${PKGS[@]}\"; do
         if [ ! -f \"\$pkg\" ]; then
             echo \"Downloading \$pkg...\"
-            wget --show-progress -q \"$MIRROR/\$pkg\"
+            wget --show-progress -q \"$MIRROR_BASE/\$pkg\"
         else
-            echo \"\$pkg already present.\"
+            echo \"\$pkg already present in workspace.\"
         fi
     done
 
     echo 'Mapping image partitions...'
     kpartx -d $RPI5_IMG || true
     KOUT=\$(kpartx -asv $RPI5_IMG)
-    echo \"\$KOUT\"
     
     BOOT_MAPPER=\$(echo \"\$KOUT\" | grep 'p1 ' | awk '{print \$3}')
     ROOT_MAPPER=\$(echo \"\$KOUT\" | grep 'p2 ' | awk '{print \$3}')
@@ -86,19 +89,19 @@ docker run --rm --privileged \
     mkdir -p /mnt/root/boot
     mount \"/dev/mapper/\$BOOT_MAPPER\" /mnt/root/boot
 
-    echo 'Injecting Kernel/Firmware...'
+    echo 'Injecting Kernel and Firmware files...'
     for pkg in \"\${PKGS[@]}\"; do
         echo \"Extracting \$pkg...\"
-        tar --zstd -xpf \"\$pkg\" -C /mnt/root --exclude='.PKGINFO' --exclude='.MTREE' --exclude='.INSTALL'
+        tar -xpf \"\$pkg\" -C /mnt/root --exclude='.PKGINFO' --exclude='.MTREE' --exclude='.INSTALL'
     done
 
-    echo 'Enabling Headless Access (SSH/Root)...'
-    # Enable sshd service
+    echo 'Enabling Headless Access (SSH/Root Key)...'
+    # Enable SSH
     ln -sf /usr/lib/systemd/system/sshd.service /mnt/root/etc/systemd/system/multi-user.target.wants/sshd.service
-    # Permit root login
+    # Allow Root SSH
     sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /mnt/root/etc/ssh/sshd_config
     
-    # Inject SSH key if provided in workspace
+    # Inject SSH key if found
     mkdir -p /mnt/root/root/.ssh && chmod 700 /mnt/root/root/.ssh
     if [ -f /work/id_rsa.pub ]; then
         cp /work/id_rsa.pub /mnt/root/root/.ssh/authorized_keys
