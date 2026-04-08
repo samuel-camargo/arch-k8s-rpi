@@ -27,9 +27,10 @@ cd "$WORKSPACE"
 
 log "Step 1: Cloning Base Image for RPi 5"
 if [ ! -f "$BASE_IMG" ]; then
-    error_exit "Base image $BASE_IMG not found!"
+    error_exit "Base image $BASE_IMG not found! Run the base build script first."
 fi
 
+# We copy the base image to start fresh
 cp "$BASE_IMG" "$RPI5_IMG"
 log "Cloned base image."
 
@@ -41,7 +42,7 @@ docker run --rm --privileged \
     set -e
     export DEBIAN_FRONTEND=noninteractive
     
-    echo 'Installing system dependencies (Added xz-utils)...'
+    echo 'Installing system dependencies...'
     apt-get update -qq && apt-get install -y -qq kpartx wget zstd xz-utils fdisk dosfstools e2fsprogs curl > /dev/null
 
     cd /work
@@ -50,7 +51,7 @@ docker run --rm --privileged \
     CORE_LIST=\$(curl -sL $MIRROR_CORE/)
     ALARM_LIST=\$(curl -sL $MIRROR_ALARM/)
     
-    # Discovery logic: Added 'grep -v headers' to ensure we get the KERNEL, not the HEADERS
+    # Discovery logic: ensures we get KERNEL, not HEADERS
     KERNEL_PKG=\$(echo \"\$CORE_LIST\" | grep -oE 'linux-rpi-[0-9][^[:space:]\"]+\.pkg\.tar\.xz' | grep -v 'headers' | sort -V | tail -n 1)
     BOOT_PKG=\$(echo \"\$ALARM_LIST\" | grep -oE 'raspberrypi-bootloader-[^[:space:]\"]+\.pkg\.tar\.xz' | sort -V | tail -n 1)
     FIRM_PKG=\$(echo \"\$ALARM_LIST\" | grep -oE 'firmware-raspberrypi-[^[:space:]\"]+\.pkg\.tar\.xz' | sort -V | tail -n 1)
@@ -60,11 +61,10 @@ docker run --rm --privileged \
     echo \"Found Firmware: \$FIRM_PKG\"
 
     if [ -z \"\$KERNEL_PKG\" ] || [ -z \"\$BOOT_PKG\" ] || [ -z \"\$FIRM_PKG\" ]; then
-        echo 'ERROR: Discovery failed. One of the packages was not found.'
-        exit 1
+        echo 'ERROR: Discovery failed.' && exit 1
     fi
 
-    # Download from appropriate source
+    # Idempotent Download
     [ ! -f \"\$KERNEL_PKG\" ] && wget -q --show-progress \"$MIRROR_CORE/\$KERNEL_PKG\"
     [ ! -f \"\$BOOT_PKG\" ] && wget -q --show-progress \"$MIRROR_ALARM/\$BOOT_PKG\"
     [ ! -f \"\$FIRM_PKG\" ] && wget -q --show-progress \"$MIRROR_ALARM/\$FIRM_PKG\"
@@ -80,7 +80,12 @@ docker run --rm --privileged \
     mkdir -p /mnt/root/boot
     mount \"/dev/mapper/\$BOOT_MAPPER\" /mnt/root/boot
 
-    echo 'Injecting Kernel and Firmware...'
+    echo 'CLEANUP: Removing generic kernel modules to free space...'
+    # Delete old modules and generic Image to make room for RPi 5 files
+    rm -rf /mnt/root/usr/lib/modules/*
+    rm -f /mnt/root/boot/Image
+
+    echo 'Injecting RPi 5 Kernel and Firmware...'
     PKGS=(\"\$KERNEL_PKG\" \"\$BOOT_PKG\" \"\$FIRM_PKG\")
     for pkg in \"\${PKGS[@]}\"; do
         echo \"Extracting \$pkg...\"
@@ -103,6 +108,7 @@ docker run --rm --privileged \
 /dev/mmcblk0p2  /       ext4    defaults,noatime  0       1
 EOF
 
+    # Kernel cmdline for RPi 5
     echo 'root=/dev/mmcblk0p2 rw rootwait console=serial0,115200 console=tty1 selinux=0 smsc95xx.turbo_mode=N' > /mnt/root/boot/cmdline.txt
 
     sync
