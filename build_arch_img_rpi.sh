@@ -4,9 +4,9 @@
 set -e
 
 # --- CONFIGURATION (UPDATE THESE FOR EACH NODE) ---
-HOSTNAME="kube-worker-03"         # Name: master-01, master-02, worker-01, etc.
-PI_VERSION="4"                    # Hardware: 4 or 5
-STATIC_IP="192.168.1.162/24"      # IPs: .150 (M1), .151 (M2), .160 (W1), .161 (W2), .162 (W3)
+HOSTNAME="kube-worker-03"         
+PI_VERSION="4"                    
+STATIC_IP="192.168.1.162/24"      
 GATEWAY="192.168.1.1"
 WIFI_SSID="YOUR_WIFI_NAME"
 WIFI_PASS="YOUR_WIFI_PASSWORD"
@@ -19,7 +19,7 @@ TARGET_IMG="${HOSTNAME}.img"
 ARCH_TARBALL="ArchLinuxARM-rpi-aarch64-latest.tar.gz"
 LOG_FILE="$WORKSPACE/build.log"
 
-# --- STYLING & HELPERS ---
+# --- STYLING ---
 B_MAGENTA='\033[1;35m'
 B_CYAN='\033[1;36m'
 B_GREEN='\033[1;32m'
@@ -40,28 +40,12 @@ echo "--- Build Log Started $(date) ---" > "$LOG_FILE"
 cd "$WORKSPACE"
 
 # =========================================================
-# PRE-FLIGHT CHECK
-# =========================================================
-log_header "PRE-FLIGHT CHECK"
-echo -e "  Target Host: ${B_GREEN}$HOSTNAME${NC}"
-echo -e "  Hardware:    ${B_GREEN}Raspberry Pi $PI_VERSION${NC}"
-echo -e "  Network:     ${B_GREEN}$STATIC_IP${NC} via ${B_GREEN}$WIFI_SSID${NC}"
-echo -e "  Log File:    ${B_CYAN}$LOG_FILE${NC}"
-
-# =========================================================
 # PHASE 1: BASE IMAGE GENERATION
 # =========================================================
-log_header "PHASE 1: BASE ARCHITECTURE"
-
-if [ ! -f "$ARCH_TARBALL" ]; then
-    log_step "Downloading Arch Linux ARM Tarball..."
-    wget -c -O "$ARCH_TARBALL" "http://os.archlinuxarm.org/os/$ARCH_TARBALL" >> "$LOG_FILE" 2>&1 || log_error "Download failed."
-else
-    log_info "Tarball found ($ARCH_TARBALL)."
-fi
-
 if [ ! -f "$BASE_IMG" ]; then
-    log_step "Building 10GB Base Image (First time only)..."
+    log_header "PHASE 1: BASE ARCHITECTURE"
+    [ ! -f "$ARCH_TARBALL" ] && wget -c -O "$ARCH_TARBALL" "http://os.archlinuxarm.org/os/$ARCH_TARBALL" >> "$LOG_FILE" 2>&1
+    
     truncate -s 10G "$BASE_IMG"
     docker run --rm --privileged -v "$WORKSPACE":/work ubuntu:22.04 bash -c "
         export DEBIAN_FRONTEND=noninteractive
@@ -80,17 +64,12 @@ if [ ! -f "$BASE_IMG" ]; then
         bsdtar -xpf $ARCH_TARBALL -C /mnt/root
         sync && umount -R /mnt/root && kpartx -d \"\$LOOP\" && losetup -d \"\$LOOP\"
     " || log_error "Base build failed."
-    log_success "Base image ready (10GB)."
-else
-    log_info "Reusing existing base image ($BASE_IMG)."
 fi
 
 # =========================================================
 # PHASE 2: CUSTOMIZATION
 # =========================================================
 log_header "PHASE 2: KUBE-NODE HARDENING"
-
-log_step "Cloning and Mapping Target Image..."
 cp "$BASE_IMG" "$TARGET_IMG"
 
 docker run --rm --privileged \
@@ -123,9 +102,12 @@ docker run --rm --privileged \
     rm -rf /mnt/target/boot/*
     done_task
 
-    task 'Injecting High-Visibility Provisioning'
+    task 'Injecting Robust Provisioning'
     cat <<'EOF_PROV' > /mnt/target/usr/local/bin/rpi-provision.sh
 #!/bin/bash
+# Fail immediately if any command fails
+set -e
+
 LOG=\"/var/log/provision.log\"
 touch \$LOG
 exec > >(tee -a \"\$LOG\") 2>&1
@@ -137,23 +119,43 @@ log_prov() {
     echo -e \"Arch Linux RPi Node: $HOSTNAME\nStatus: \$1\" > /etc/motd
 }
 
-log_prov \"🚀 STARTING FIRST-BOOT PROVISIONING\"
+# Helper for flaky mirrors: tries 5 times with forced refresh
+pacman_retry() {
+    local n=1; local max=5; local delay=10
+    while true; do
+        if yes | \"\$@\"; then break;
+        else
+            if [[ \$n -lt \$max ]]; then
+                ((n++))
+                log_prov \"⚠️ Mirror Timeout. Retrying (\$n/\$max) in \$delay seconds...\"
+                sleep \$delay
+                pacman -Syy # Force database refresh on failure
+            else
+                log_prov \"❌ FATAL ERROR: Mirror failure after \$max attempts.\"
+                echo -e \"Arch Linux RPi Node: $HOSTNAME\nStatus: FAILED AT STEP: \$*\" > /etc/motd
+                exit 1
+            fi
+        fi
+    done
+}
+
+log_prov \"🚀 STARTING PROVISIONING\"
 iw dev wlan0 set power_save off || true
 
 log_prov \"📶 (Step 1/7) Waiting for Internet...\"
 while ! ping -c 1 -W 2 8.8.8.8 &>/dev/null; do sleep 3; done
 
-log_prov \"🔑 (Step 2/7) Initializing Keyring (Takes ~2 min)...\"
+log_prov \"🔑 (Step 2/7) Initializing Keyring...\"
 pacman-key --init && pacman-key --populate archlinuxarm
-pacman -Sy archlinux-keyring --noconfirm
+pacman_retry pacman -Sy archlinux-keyring --noconfirm
 
-log_prov \"📦 (Step 3/7) System Update & K8s Prep...\"
+log_prov \"📦 (Step 3/7) Full System Upgrade...\"
 sed -i 's/#ParallelDownloads = 5/ParallelDownloads = 10/' /etc/pacman.conf
-pacman -Syu --noconfirm
+pacman_retry pacman -Syu --noconfirm
 timedatectl set-ntp true
 swapoff -a && sed -i '/swap/d' /etc/fstab
 
-log_prov \"⚙️ (Step 4/7) Configuring Kernel Modules...\"
+log_prov \"⚙️ (Step 4/7) Loading K8s Modules...\"
 mkdir -p /etc/modules-load.d && echo -e \"overlay\nbr_netfilter\" > /etc/modules-load.d/k8s.conf
 modprobe overlay || true && modprobe br_netfilter || true
 cat <<EOF_SYS > /etc/sysctl.d/k8s.conf
@@ -163,18 +165,24 @@ net.ipv4.ip_forward                 = 1
 EOF_SYS
 sysctl --system
 
-log_prov \"🏗️ (Step 5/7) Installing Containerd & K8s...\"
-pacman -S --noconfirm containerd kubeadm kubelet kubectl runc
+log_prov \"🏗️ (Step 5/7) Installing K8s Tools...\"
+pacman_retry pacman -S --noconfirm containerd kubeadm kubelet kubectl runc
 mkdir -p /etc/containerd && containerd config default > /etc/containerd/config.toml
 sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
 systemctl enable --now containerd kubelet
 
-log_prov \"💾 (Step 6/7) Expanding Filesystem...\"
+# Verification
+if ! command -v containerd &> /dev/null; then
+    log_prov \"❌ FATAL: Containerd installation failed verification.\"
+    exit 1
+fi
+
+log_prov \"💾 (Step 6/7) Finalizing Disk...\"
 ROOT_DEV=\$(findmnt / -o SOURCE -n)
 echo -e \"d\n2\nn\np\n2\n\n\ny\nw\" | fdisk \${ROOT_DEV%p*} > /dev/null 2>&1
 partx -u \${ROOT_DEV%p*} || true && resize2fs \$ROOT_DEV > /dev/null 2>&1
 
-log_prov \"✅ (Step 7/7) COMPLETE! Cluster Node Ready.\"
+log_prov \"✅ (Step 7/7) COMPLETE! Node is Ready.\"
 echo -e \"Arch Linux RPi Node: $HOSTNAME\nStatus: PROVISIONED / READY\" > /etc/motd
 systemctl disable rpi-provision.service && rm /etc/systemd/system/rpi-provision.service
 EOF_PROV
@@ -182,7 +190,7 @@ EOF_PROV
 
     cat <<EOF > /mnt/target/etc/systemd/system/rpi-provision.service
 [Unit]
-Description=K8s Provision
+Description=Robust K8s Provision
 After=network-online.target
 Wants=network-online.target
 [Service]
@@ -241,12 +249,8 @@ EOF
     done_task
 " || log_error "Build failed."
 
-# =========================================================
-# FINAL SUMMARY
-# =========================================================
 DURATION=$((SECONDS - START_TIME))
 log_header "BUILD COMPLETE"
 log_success "Target:    ${B_GREEN}$TARGET_IMG${NC}"
 log_success "Time:      ${B_YELLOW}$((DURATION / 60))m $((DURATION % 60))s${NC}"
-log_success "Command:   ${B_CYAN}sudo dd if=$TARGET_IMG of=/dev/diskX bs=4M status=progress${NC}"
 echo -e "\n${B_MAGENTA}=======================================================${NC}"
