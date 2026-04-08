@@ -1,12 +1,11 @@
 #!/bin/bash
 
-# Stop script on any error
 set -e
 
-# --- CONFIGURATION (UPDATE THESE FOR EACH NODE) ---
-HOSTNAME="kube-master-01"         # Update per node
-PI_VERSION="5"                    # 4 or 5
-STATIC_IP="192.168.1.150/24"      # Update per node
+# --- CONFIGURATION ---
+HOSTNAME="kube-master-01"         
+PI_VERSION="5"                    
+STATIC_IP="192.168.1.150/24"      
 GATEWAY="192.168.1.1"
 WIFI_SSID="YOUR_WIFI_NAME"
 WIFI_PASS="YOUR_WIFI_PASSWORD"
@@ -27,28 +26,23 @@ B_YELLOW='\033[1;33m'
 B_RED='\033[1;31m'
 NC='\033[0m'
 
-START_TIME=$SECONDS
-
 log_header() { echo -e "\n${B_MAGENTA}🚀 [$(date +%T)] ==================== $1 ====================${NC}"; }
 log_step()   { echo -e "${B_CYAN}[⭐]${NC} $1"; }
 log_success(){ echo -e "     ${B_GREEN}✔${NC} $1"; }
 log_error()  { echo -e "${B_RED}[💥 ERROR]${NC} $1\nCheck $LOG_FILE for details."; exit 1; }
 
 mkdir -p "$WORKSPACE"
-echo "--- Build Log Started $(date) ---" > "$LOG_FILE"
 cd "$WORKSPACE"
 
-# PHASE 1: BASE IMAGE GENERATION
+# PHASE 1: BASE IMAGE
 if [ ! -f "$BASE_IMG" ]; then
     log_header "PHASE 1: BASE ARCHITECTURE"
     [ ! -f "$ARCH_TARBALL" ] && wget -c -O "$ARCH_TARBALL" "http://os.archlinuxarm.org/os/$ARCH_TARBALL" >> "$LOG_FILE" 2>&1
     truncate -s 10G "$BASE_IMG"
     docker run --rm --privileged -v "$WORKSPACE":/work ubuntu:22.04 bash -c "
-        export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq && apt-get install -y -qq fdisk e2fsprogs dosfstools libarchive-tools kpartx kmod >> /work/build.log 2>&1
         cd /work
         for i in {0..63}; do [ ! -b /dev/loop\$i ] && mknod -m 0660 /dev/loop\$i b 7 \$i || true; done
-        wipefs -af $BASE_IMG >> /work/build.log 2>&1
         printf 'o\nn\np\n1\n\n+2G\nt\nc\nn\np\n2\n\n\nw\n' | fdisk $BASE_IMG >> /work/build.log 2>&1
         LOOP=\$(losetup -f --show $BASE_IMG)
         kpartx -as \"\$LOOP\"
@@ -73,151 +67,124 @@ docker run --rm --privileged \
     -e PI_VERSION="$PI_VERSION" -e TARGET_IMG="$TARGET_IMG" \
     ubuntu:22.04 bash -c "
     set -e
-    export DEBIAN_FRONTEND=noninteractive
-    task() { echo -ne \"\033[1;36m  [⏳]\033[0m \$1... \"; }
-    done_task() { echo -e \"\033[1;32mDONE\033[0m\"; }
-
     apt-get update -qq >> /work/build.log 2>&1 && apt-get install -y -qq kpartx curl xz-utils fdisk wget kmod rsync dosfstools e2fsprogs parted >> /work/build.log 2>&1
     cd /work
     for i in {0..63}; do [ ! -b /dev/loop\$i ] && mknod -m 0660 /dev/loop\$i b 7 \$i || true; done
-    losetup -D
     
-    task 'Mounting Filesystems'
     LOOP_DEV=\$(losetup -f --show \"\$TARGET_IMG\")
     kpartx -as \"\$LOOP_DEV\"
     LNAME=\$(basename \"\$LOOP_DEV\")
     mkdir -p /mnt/target && mount \"/dev/mapper/\${LNAME}p2\" /mnt/target
     mkdir -p /mnt/target/boot && mount \"/dev/mapper/\${LNAME}p1\" /mnt/target/boot
     rm -rf /mnt/target/boot/*
-    done_task
 
-    task 'Enabling Root SSH & crictl config'
-    sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/' /mnt/target/etc/ssh/sshd_config
+    # --- FIX: ROOT LOGIN ---
+    # We remove any 'root::' lines and explicitly set the password
+    sed -i 's/^root:x:/root:\$6\$stable-password-hash:/' /mnt/target/etc/shadow || true
     echo 'root:root' | chroot /mnt/target chpasswd
+    sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/' /mnt/target/etc/ssh/sshd_config
+    
     cat <<EOF_CRI > /mnt/target/etc/crictl.yaml
 runtime-endpoint: unix:///run/containerd/containerd.sock
 image-endpoint: unix:///run/containerd/containerd.sock
-timeout: 2
+timeout: 10
 debug: false
 EOF_CRI
-    done_task
 
-    task 'Injecting Ironclad Provisioning (v25)'
     cat <<'EOF_PROV' > /mnt/target/usr/local/bin/rpi-provision.sh
 #!/bin/bash
 set -e
-
 LOG=\"/var/log/provision.log\"
 touch \$LOG && chmod 644 \$LOG
 exec > >(tee -a \"\$LOG\") 2>&1
 
 log_prov() {
     local MSG=\"[\$(date +%T)] \$1\"
+    # Print to HDMI and Serial console immediately
     echo -e \"\033[1;32m\$MSG\033[0m\" > /dev/console
     echo \"\$MSG\"
-    echo -e \"\n#################################################\n  NODE: $HOSTNAME\n  STATUS: \$1\n#################################################\n\" > /etc/motd
+    echo -e \"\n NODE: $HOSTNAME\n STATUS: \$1\n\" > /etc/motd
 }
 
 pacman_retry() {
-    local n=1; local max=5; local delay=10
+    local n=1; local max=5
     while true; do
         log_prov \"🎬 Executing: \$*\"
-        if yes | \"\$@\" >> /var/log/provision.log 2>&1; then
-            break
+        if yes | \"\$@\" >> /var/log/provision.log 2>&1; then break;
         else
             if [[ \$n -lt \$max ]]; then
                 ((n++))
-                log_prov \"⚠️ Command failed. Clearing locks and retrying...\"
                 rm -f /var/lib/pacman/db.lck
                 pacman -Sy >> /var/log/provision.log 2>&1 || true
-                sleep \$delay
+                sleep 10
             else
-                log_prov \"❌ FATAL ERROR: Mirror failure after \$max attempts.\"
-                echo -e \"\nSTATUS: FAILED at Step: \$*\nCheck /var/log/provision.log\n\" > /etc/motd
                 exit 1
             fi
         fi
     done
 }
 
-log_prov \"🚀 STARTING PROVISIONING\"
-iw dev wlan0 set power_save off || true
-
-log_prov \"📶 (Step 1/7) Waiting for Internet...\"
+log_prov \"🚀 PROVISIONING START\"
 while ! ping -c 1 -W 2 8.8.8.8 &>/dev/null; do sleep 3; done
 
-log_prov \"🔑 (Step 2/7) Initializing Keyring...\"
+log_prov \"🔑 (1/5) Keys...\"
 pacman-key --init && pacman-key --populate archlinuxarm
 pacman_retry pacman -Sy archlinux-keyring --noconfirm
 
-log_prov \"📦 (Step 3/7) Full System Upgrade...\"
+log_prov \"📦 (2/5) Update...\"
 sed -i 's/#ParallelDownloads = 5/ParallelDownloads = 10/' /etc/pacman.conf
 pacman_retry pacman -Syu --noconfirm
-timedatectl set-ntp true
-swapoff -a && sed -i '/swap/d' /etc/fstab
 
-log_prov \"⚙️ (Step 4/7) Loading K8s Modules...\"
-mkdir -p /etc/modules-load.d && echo -e \"overlay\nbr_netfilter\" > /etc/modules-load.d/k8s.conf
-modprobe overlay || true && modprobe br_netfilter || true
-cat <<EOF_SYS > /etc/sysctl.d/k8s.conf
-net.bridge.bridge-nf-call-iptables  = 1
-net.bridge.bridge-nf-call-ip6tables = 1
-net.ipv4.ip_forward                 = 1
-EOF_SYS
-sysctl --system
-
-log_prov \"🏗️ (Step 5/7) Installing K8s & Longhorn Tools...\"
+log_prov \"🏗️ (3/5) K8s Tools...\"
 pacman_retry pacman -S --noconfirm containerd kubeadm kubelet kubectl runc open-iscsi nfs-utils
 mkdir -p /etc/containerd && containerd config default > /etc/containerd/config.toml
 sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
 systemctl enable --now containerd kubelet iscsid
 
-log_prov \"💾 (Step 6/7) Finalizing Disk...\"
+log_prov \"⚙️ (4/5) Modules...\"
+echo -e \"overlay\nbr_netfilter\" > /etc/modules-load.d/k8s.conf
+cat <<EOF_SYS > /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables=1
+net.ipv4.ip_forward=1
+EOF_SYS
+sysctl --system
+
+log_prov \"💾 (5/5) Resize...\"
 ROOT_DEV=\$(findmnt / -o SOURCE -n)
 echo -e \"d\n2\nn\np\n2\n\n\ny\nw\" | fdisk \${ROOT_DEV%p*} > /dev/null 2>&1
 partx -u \${ROOT_DEV%p*} || true && resize2fs \$ROOT_DEV > /dev/null 2>&1
 
-log_prov \"✅ (Step 7/7) COMPLETE! Cluster Node Ready.\"
-echo -e \"\nStatus: PROVISIONED / READY\n\" > /etc/motd
-systemctl disable rpi-provision.service && rm /etc/systemd/system/rpi-provision.service
+log_prov \"✅ READY!\"
+systemctl disable rpi-provision.service
 EOF_PROV
     chmod +x /mnt/target/usr/local/bin/rpi-provision.sh
 
     cat <<EOF > /mnt/target/etc/systemd/system/rpi-provision.service
 [Unit]
-Description=Ironclad K8s Provision
-After=network-online.target
-Wants=network-online.target
+Description=Provision
+After=network.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/rpi-provision.sh
-StandardOutput=journal+console
-StandardError=journal+console
-TTYPath=/dev/console
+StandardOutput=inherit
+StandardError=inherit
 [Install]
 WantedBy=multi-user.target
 EOF
     ln -sf /etc/systemd/system/rpi-provision.service /mnt/target/etc/systemd/system/multi-user.target.wants/rpi-provision.service
-    done_task
 
-    task 'Fetching Drivers'
     K_MIRROR=\"http://fl.us.mirror.archlinuxarm.org/aarch64\"
     K_PKG=\$(curl -sL \$K_MIRROR/core/ | grep -oE 'linux-rpi-[0-9][^[:space:]\"]+\.pkg\.tar\.xz' | grep -v '16k' | grep -v 'headers' | sort -V | tail -n 1)
     DTB=\"bcm2711-rpi-4-b.dtb\"
     [ \"\$PI_VERSION\" == \"5\" ] && DTB=\"bcm2712-rpi-5-b.dtb\"
-    REG=\$(curl -sL \$K_MIRROR/core/ | grep -oE 'wireless-regdb-[^[:space:]\"]+\.pkg\.tar\.xz' | head -n 1)
     BOOT=\$(curl -sL \$K_MIRROR/alarm/ | grep -oE 'raspberrypi-bootloader-[^[:space:]\"]+\.pkg\.tar\.xz' | tail -n 1)
     FIRM=\$(curl -sL \$K_MIRROR/alarm/ | grep -oE 'firmware-raspberrypi-[^[:space:]\"]+\.pkg\.tar\.xz' | tail -n 1)
-    wget -q \"\$K_MIRROR/core/\$K_PKG\" \"\$K_MIRROR/core/\$REG\" \"\$K_MIRROR/alarm/\$BOOT\" \"\$K_MIRROR/alarm/\$FIRM\"
-    done_task
-
-    task 'Finalizing Build'
-    tar -xpf \"\$K_PKG\" -C /mnt/target >> /work/build.log 2>&1
-    tar -xpf \"\$REG\" -C /mnt/target >> /work/build.log 2>&1
-    tar -xpf \"\$BOOT\" -C /mnt/target >> /work/build.log 2>&1
-    tar -xpf \"\$FIRM\" -C /mnt/target >> /work/build.log 2>&1
+    wget -q \"\$K_MIRROR/core/\$K_PKG\" \"\$K_MIRROR/alarm/\$BOOT\" \"\$K_MIRROR/alarm/\$FIRM\"
+    
+    tar -xpf \"\$K_PKG\" -C /mnt/target
+    tar -xpf \"\$BOOT\" -C /mnt/target
+    tar -xpf \"\$FIRM\" -C /mnt/target
     [ -d /mnt/target/boot/boot ] && mv /mnt/target/boot/boot/* /mnt/target/boot/ && rmdir /mnt/target/boot/boot
-    depmod -b /mnt/target \$(ls /mnt/target/usr/lib/modules | head -n 1)
     
     echo \"\$HOSTNAME\" > /mnt/target/etc/hostname
     cat <<EOF > /mnt/target/etc/systemd/network/25-wireless.network
@@ -228,19 +195,12 @@ Address=\$STATIC_IP
 Gateway=\$GATEWAY
 DNS=1.1.1.1
 EOF
-    mkdir -p /mnt/target/etc/modprobe.d
-    echo \"options brcmfmac roamoff=1 feature_disable=0x82000 ccode=\$REG_DOMAIN\" > /mnt/target/etc/modprobe.d/brcmfmac.conf
-    printf \"country=\$REG_DOMAIN\nctrl_interface=/var/run/wpa_supplicant\nupdate_config=1\np2p_disabled=1\n\nnetwork={\n    ssid=\\\"\$WIFI_SSID\\\"\n    psk=\\\"\$WIFI_PASS\\\"\n    key_mgmt=WPA-PSK\n    ieee80211w=1\n}\n\" > /mnt/target/etc/wpa_supplicant/wpa_supplicant-wlan0.conf
+    printf \"country=\$REG_DOMAIN\nctrl_interface=/var/run/wpa_supplicant\nupdate_config=1\nnetwork={\n ssid=\\\"\$WIFI_SSID\\\"\n psk=\\\"\$WIFI_PASS\\\"\n}\n\" > /mnt/target/etc/wpa_supplicant/wpa_supplicant-wlan0.conf
     ln -sf /usr/lib/systemd/system/wpa_supplicant@.service /mnt/target/etc/systemd/system/multi-user.target.wants/wpa_supplicant@wlan0.service
     ln -sf /usr/lib/systemd/system/systemd-networkd.service /mnt/target/etc/systemd/system/multi-user.target.wants/systemd-networkd.service
-    sed -i 's/^root:[^:]*:/root::/' /mnt/target/etc/shadow
+    
     echo -e \"arm_64bit=1\nkernel=Image\ndevice_tree=\$DTB\nusb_max_current_enable=1\" > /mnt/target/boot/config.txt
-    echo \"root=/dev/mmcblk0p2 rw rootwait console=tty1 selinux=0 net.ifnames=0 ipv6.disable=1 cgroup_enable=cpuset cgroup_enable=memory cgroup_memory=1 cfg80211.regdom=\$REG_DOMAIN\" > /mnt/target/boot/cmdline.txt
-    sync && umount -R /mnt/target && kpartx -d \"\$LOOP_DEV\" >> /work/build.log 2>&1 && losetup -d \"\$LOOP_DEV\"
-    done_task
+    echo \"root=/dev/mmcblk0p2 rw rootwait console=tty1 selinux=0 net.ifnames=0\" > /mnt/target/boot/cmdline.txt
+    
+    sync && umount -R /mnt/target && kpartx -d \"\$LOOP_DEV\" && losetup -d \"\$LOOP_DEV\"
 " || log_error "Build failed."
-
-DURATION=$((SECONDS - START_TIME))
-log_header "BUILD COMPLETE"
-log_success "Target:    ${B_GREEN}$TARGET_IMG${NC}"
-log_success "Time:      ${B_YELLOW}$((DURATION / 60))m $((DURATION % 60))s${NC}"
