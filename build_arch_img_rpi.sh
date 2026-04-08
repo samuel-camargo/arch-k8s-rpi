@@ -9,7 +9,6 @@ WORKSPACE="$HOME/rpi_arch_build"
 BASE_IMG="rpi_arch_base.img"
 RPI5_IMG="rpi5_master.img"
 
-# Use the Florida mirror you provided
 MIRROR_CORE="http://fl.us.mirror.archlinuxarm.org/aarch64/core"
 MIRROR_ALARM="http://fl.us.mirror.archlinuxarm.org/aarch64/alarm"
 
@@ -27,7 +26,7 @@ cd "$WORKSPACE"
 log "Step 1: Preparing Clean Image"
 cp "$BASE_IMG" "$RPI5_IMG"
 
-log "Step 2: Syncing Kernel and Modules via Docker"
+log "Step 2: Launching Docker for Direct Loop Injection"
 docker run --rm --privileged \
     --dns 8.8.8.8 \
     -v "$WORKSPACE":/work \
@@ -38,22 +37,37 @@ docker run --rm --privileged \
     apt-get update -qq && apt-get install -y -qq kpartx curl xz-utils fdisk wget kmod > /dev/null
 
     cd /work
-    for i in {0..15}; do [ ! -b /dev/loop\$i ] && mknod /dev/loop\$i b 7 \$i || true; done
+    
+    echo 'Provisioning loop devices manually...'
+    # Force creation of device nodes 0 through 15
+    for i in {0..15}; do
+        if [ ! -b /dev/loop\$i ]; then
+            mknod -m 0660 /dev/loop\$i b 7 \$i || true
+        fi
+    done
 
     echo 'Finding matching Kernel/Module package...'
-    # We grab the standard linux-rpi (4k) package which contains both the kernel image and all modules
     KERNEL_PKG=\$(curl -sL $MIRROR_CORE/ | grep -oE 'linux-rpi-[0-9][^[:space:]\"]+\.pkg\.tar\.xz' | grep -v 'headers' | grep -v '16k' | sort -V | tail -n 1)
     FIRM_RPI=\$(curl -sL $MIRROR_ALARM/ | grep -oE 'firmware-raspberrypi-[^[:space:]\"]+\.pkg\.tar\.xz' | sort -V | tail -n 1)
     BOOT_PKG=\$(curl -sL $MIRROR_ALARM/ | grep -oE 'raspberrypi-bootloader-[^[:space:]\"]+\.pkg\.tar\.xz' | sort -V | tail -n 1)
 
-    # Download if not present
     [ ! -f \"\$KERNEL_PKG\" ] && wget -q \"$MIRROR_CORE/\$KERNEL_PKG\"
     [ ! -f \"\$FIRM_RPI\" ] && wget -q \"$MIRROR_ALARM/\$FIRM_RPI\"
     [ ! -f \"\$BOOT_PKG\" ] && wget -q \"$MIRROR_ALARM/\$BOOT_PKG\"
 
-    echo 'Mapping image partitions...'
-    kpartx -d $RPI5_IMG || true
-    KOUT=\$(kpartx -asv $RPI5_IMG)
+    echo 'Mapping image partitions (using explicit loop binding)...'
+    # Detach everything first to be safe
+    losetup -D
+    
+    # Manually find and bind the first free loop device
+    LOOP_DEV=\$(losetup -f)
+    losetup \"\$LOOP_DEV\" $RPI5_IMG
+    
+    # Use kpartx on the specific device we just bound
+    KOUT=\$(kpartx -asv \"\$LOOP_DEV\")
+    echo \"\$KOUT\"
+    
+    # Extract partition mapper names
     BOOT_MAPPER=\$(echo \"\$KOUT\" | grep 'p1 ' | awk '{print \$3}')
     ROOT_MAPPER=\$(echo \"\$KOUT\" | grep 'p2 ' | awk '{print \$3}')
     
@@ -62,26 +76,19 @@ docker run --rm --privileged \
     mkdir -p /mnt/root/boot
     mount \"/dev/mapper/\$BOOT_MAPPER\" /mnt/root/boot
 
-    echo 'Wiping existing drivers and boot files (Total Sync)...'
-    rm -rf /mnt/root/usr/lib/modules/*
-    rm -rf /mnt/root/boot/*
-
-    echo \"Extracting matched Kernel and Modules from \$KERNEL_PKG...\"
+    echo 'Syncing Kernel and Modules...'
+    rm -rf /mnt/root/usr/lib/modules/* /mnt/root/boot/*
     tar -xpf \"\$KERNEL_PKG\" -C /mnt/root
     tar -xpf \"\$FIRM_RPI\" -C /mnt/root
     tar -xpf \"\$BOOT_PKG\" -C /mnt/root
 
-    echo 'Fixing Boot structure...'
-    if [ -d /mnt/root/boot/boot ]; then
-        mv /mnt/root/boot/boot/* /mnt/root/boot/
-        rmdir /mnt/root/boot/boot
-    fi
+    [ -d /mnt/root/boot/boot ] && mv /mnt/root/boot/boot/* /mnt/root/boot/ && rmdir /mnt/root/boot/boot
 
-    echo 'Generating module dependency map...'
+    # Generate module map
     KVER=\$(ls /mnt/root/usr/lib/modules | head -n 1)
     depmod -b /mnt/root \$KVER
 
-    echo 'Configuring WiFi...'
+    echo 'Injecting WiFi and enabling SSH...'
     mkdir -p /mnt/root/etc/wpa_supplicant
     cat <<EOF > /mnt/root/etc/wpa_supplicant/wpa_supplicant-wlan0.conf
 ctrl_interface=/var/run/wpa_supplicant
@@ -91,35 +98,33 @@ network={
     psk=\"$WIFI_PASS\"
 }
 EOF
-    # Setup networkd
     cat <<EOF > /mnt/root/etc/systemd/network/25-wireless.network
 [Match]
 Name=wlan0
 [Network]
 DHCP=yes
 EOF
-    # Enable services
     ln -sf /usr/lib/systemd/system/wpa_supplicant@.service /mnt/root/etc/systemd/system/multi-user.target.wants/wpa_supplicant@wlan0.service
     ln -sf /usr/lib/systemd/system/systemd-networkd.service /mnt/root/etc/systemd/system/multi-user.target.wants/systemd-networkd.service
     ln -sf /usr/lib/systemd/system/sshd.service /mnt/root/etc/systemd/system/multi-user.target.wants/sshd.service
 
-    echo 'Configuring Boot with matched Device Tree...'
+    echo 'Finalizing config.txt...'
     cat <<EOF > /mnt/root/boot/config.txt
 arm_64bit=1
 kernel=Image
 device_tree=bcm2712-rpi-5-b.dtb
 overlay_prefix=overlays/
 usb_max_current_enable=1
+dtparam=pcie_aspm=off
 EOF
 
     echo \"root=/dev/mmcblk0p2 rw rootwait console=tty1 selinux=0\" > /mnt/root/boot/cmdline.txt
-
-    # Clear root password for emergency login
     sed -i 's/root:\*:/root::/' /mnt/root/etc/shadow
 
     sync
     umount -R /mnt/root
-    kpartx -d $RPI5_IMG
+    kpartx -d \"\$LOOP_DEV\"
+    losetup -d \"\$LOOP_DEV\"
     echo 'Done.'
 "
 
