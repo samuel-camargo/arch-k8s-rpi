@@ -34,7 +34,6 @@ if [ ! -f "$BASE_IMG" ]; then
     error_exit "Base image $BASE_IMG not found! Run the base build script first."
 fi
 
-# Only copy if the target doesn't exist to maintain idempotency
 if [ ! -f "$RPI5_IMG" ]; then
     cp "$BASE_IMG" "$RPI5_IMG"
     log "Cloned $BASE_IMG to $RPI5_IMG."
@@ -57,28 +56,40 @@ docker run --rm --privileged \
 
     cd /work
     
-    echo -e \"\${BLUE}[Container]${NC} Discovering latest RPi 5 package versions...\"
-    # Dynamically find the latest filenames from the mirror
-    # We look for the most recent linux-rpi, bootloader, and firmware
-    HTML_LIST=\$(curl -s $MIRROR/)
+    echo -e \"\${BLUE}[Container]${NC} Discovering latest RPi 5 packages from mirror...\"
+    # Get the directory listing
+    HTML_LIST=\$(curl -sL $MIRROR/)
     
+    # Robust discovery function
+    # 1. Finds the package name
+    # 2. Extracts everything between href=\" and \"
+    # 3. Filters for the correct architecture (aarch64 or any)
+    # 4. Takes the last one (usually highest version)
     GET_LATEST() {
-        echo \"\$HTML_LIST\" | grep -oE \"\$1-[0-9][^\ ]+\.pkg\.tar\.zst\" | head -n 1
+        echo \"\$HTML_LIST\" | grep -oE \"href=\\\"\$1-[0-9][^\ ]+\.pkg\.tar\.zst\\\"\" | sed 's/href=\"//;s/\"//' | sort -V | tail -n 1
     }
 
     KERNEL_PKG=\$(GET_LATEST \"linux-rpi\")
     BOOT_PKG=\$(GET_LATEST \"raspberrypi-bootloader\")
     FIRM_PKG=\$(GET_LATEST \"raspberrypi-firmware\")
 
+    echo -e \"\${BLUE}[Container]${NC} Discovered:\"
+    echo \"  - Kernel: \$KERNEL_PKG\"
+    echo \"  - Bootloader: \$BOOT_PKG\"
+    echo \"  - Firmware: \$FIRM_PKG\"
+
     PKGS=(\"\$KERNEL_PKG\" \"\$BOOT_PKG\" \"\$FIRM_PKG\")
 
     for pkg in \"\${PKGS[@]}\"; do
-        if [ -z \"\$pkg\" ]; then echo \"Failed to find a package on mirror!\"; exit 1; fi
+        if [ -z \"\$pkg\" ]; then 
+            echo -e \"\${RED}[ERROR] Failed to discover one or more packages on mirror.\${NC}\"
+            exit 1
+        fi
         if [ ! -f \"\$pkg\" ]; then
             echo \"Downloading \$pkg...\"
             wget --show-progress -q \"$MIRROR/\$pkg\"
         else
-            echo \"\$pkg already present.\"
+            echo \"\$pkg already present in workspace.\"
         fi
     done
 
@@ -86,6 +97,7 @@ docker run --rm --privileged \
     kpartx -d $RPI5_IMG || true
     KOUT=\$(kpartx -asv $RPI5_IMG)
     
+    # Use grep to find the specific loop device created
     BOOT_MAPPER=\$(echo \"\$KOUT\" | grep 'p1 ' | awk '{print \$3}')
     ROOT_MAPPER=\$(echo \"\$KOUT\" | grep 'p2 ' | awk '{print \$3}')
     
@@ -94,25 +106,29 @@ docker run --rm --privileged \
     mkdir -p /mnt/root/boot
     mount \"/dev/mapper/\$BOOT_MAPPER\" /mnt/root/boot
 
-    echo -e \"\${BLUE}[Container]${NC} Injecting files...\"
+    echo -e \"\${BLUE}[Container]${NC} Injecting files into partitions...\"
     for pkg in \"\${PKGS[@]}\"; do
         echo \"Extracting \$pkg...\"
-        tar --zstd -xpf \"\$pkg\" -C /mnt/root --exclude='.PKGINFO' --exclude='.MTREE'
+        tar --zstd -xpf \"\$pkg\" -C /mnt/root --exclude='.PKGINFO' --exclude='.MTREE' --exclude='.INSTALL'
     done
 
-    echo -e \"\${BLUE}[Container]${NC} Configuring boot files...\"
+    echo -e \"\${BLUE}[Container]${NC} Finalizing boot configuration...\"
+    # Ensure fstab uses the SD card device naming
     cat <<EOF > /mnt/root/etc/fstab
 /dev/mmcblk0p1  /boot   vfat    defaults        0       0
 /dev/mmcblk0p2  /       ext4    defaults,noatime  0       1
 EOF
 
-    # Essential for RPi 5: rootwait and correct console
-    echo 'root=/dev/mmcblk0p2 rw rootwait console=serial0,115200 console=tty1 selinux=0 smsc95xx.turbo_mode=N' > /mnt/root/boot/cmdline.txt
+    # Configure cmdline.txt for RPi 5
+    echo 'root=/dev/mmcblk0p2 rw rootwait console=serial0,115200 console=tty1 selinux=0 smsc95xx.turbo_mode=N dwc_otg.lpm_enable=0' > /mnt/root/boot/cmdline.txt
+
+    # Clean up any generic kernel modules to save space
+    rm -rf /mnt/root/usr/lib/modules/*-ARCH || true
 
     sync
     umount -R /mnt/root
     kpartx -d $RPI5_IMG
-    echo -e \"\${BLUE}[Container]${NC} Injection complete.\"
+    echo -e \"\${BLUE}[Container]${NC} Injection successful.\"
 "
 
 echo -e "${GREEN}------------------------------------------------${NC}"
