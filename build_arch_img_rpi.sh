@@ -9,7 +9,7 @@ IMG_NAME="rpi_arch_base.img"
 IMG_FILE="$WORKSPACE/$IMG_NAME"
 ARCH_TARBALL="ArchLinuxARM-rpi-aarch64-latest.tar.gz"
 DOWNLOAD_URL="http://os.archlinuxarm.org/os/$ARCH_TARBALL"
-# 7GB to be safe (2GB Boot + ~4.5GB Root)
+# 7GB (2GB Boot + ~4.5GB Root + overhead)
 IMG_SIZE="7G" 
 
 mkdir -p "$WORKSPACE"
@@ -31,7 +31,6 @@ if [ ! -f "$IMG_FILE" ]; then
     truncate -s "$IMG_SIZE" "$IMG_FILE"
 else
     echo "File exists. Checking for partition table..."
-    # If 'file' doesn't see a partition table, it's just a blank 'data' file
     if file "$IMG_FILE" | grep -q "boot sector"; then
         echo "Valid partition table found."
     else
@@ -46,42 +45,38 @@ docker run --rm --privileged \
     -v "$WORKSPACE":/work \
     ubuntu:latest bash -c "
     set -e
-    echo 'Installing dependencies (kpartx, fdisk, libarchive)...'
-    apt-get update -qq
-    apt-get install -y -qq fdisk e2fsprogs dosfstools libarchive-tools kpartx > /dev/null
+    echo 'Installing dependencies...'
+    apt-get update -qq && apt-get install -y -qq fdisk e2fsprogs dosfstools libarchive-tools kpartx > /dev/null
 
     cd /work
     
     echo 'Cleaning up existing mappings...'
     kpartx -d $IMG_NAME || true
     
-    # Idempotent Partitioning
-    # Check if the image file already has partitions using fdisk -l
-    if ! fdisk -l $IMG_NAME | grep -q \"$IMG_NAME\"1; then
+    # Partitioning
+    if ! fdisk -l $IMG_NAME | grep -q \"${IMG_NAME}1\"; then
         echo 'Partitioning (2GB Boot, Remainder Root)...'
-        # o: clear, n: new, p: primary, 1: part num, default start, +2G: size, t: type, c: FAT32, n: new, p: primary, 2, default, default, w: write
         printf 'o\nn\np\n1\n\n+2G\nt\nc\nn\np\n2\n\n\nw\n' | fdisk $IMG_NAME
         sync
     else
         echo 'Partition table already exists.'
     fi
 
-    echo 'Mapping device partitions with kpartx...'
-    # kpartx -a (add) -v (verbose) -s (sync)
-    # This creates devices in /dev/mapper/
-    KOUT=\$(kpartx -avs $IMG_NAME)
+    echo 'Mapping device partitions...'
+    # Use -as to sync and wait for device nodes
+    KOUT=\$(kpartx -asv $IMG_NAME)
     echo \"\$KOUT\"
     
-    # Extract the loop device name (e.g., loop0)
-    LOOP_NAME=\$(echo \"\$KOUT\" | head -n 1 | awk '{print \$3}')
+    # Extract the loop device name (e.g., loop1) from 'add map loop1p1'
+    LOOP_NAME=\$(echo \"\$KOUT\" | head -n 1 | awk '{print \$3}' | sed 's/p[0-9]//g')
     BOOT_DEV=\"/dev/mapper/\${LOOP_NAME}p1\"
     ROOT_DEV=\"/dev/mapper/\${LOOP_NAME}p2\"
 
-    echo \"Formatting \$BOOT_DEV and \$ROOT_DEV...\"
+    echo \"Formatting \$BOOT_DEV (BOOT) and \$ROOT_DEV (ROOT)...\"
     mkfs.vfat -n BOOT \"\$BOOT_DEV\"
     mkfs.ext4 -F -L ROOT \"\$ROOT_DEV\"
     
-    echo 'Extracting Arch Linux ARM...'
+    echo 'Extracting Arch Linux ARM (this takes a minute)...'
     mkdir -p /mnt/root
     mount \"\$ROOT_DEV\" /mnt/root
     mkdir -p /mnt/root/boot
@@ -89,7 +84,7 @@ docker run --rm --privileged \
     
     bsdtar -xpf $ARCH_TARBALL -C /mnt/root
     
-    echo 'Finalizing and Unmounting...'
+    echo 'Finalizing...'
     sync
     umount -R /mnt/root
     kpartx -d $IMG_NAME
@@ -98,5 +93,5 @@ docker run --rm --privileged \
 
 echo "-------------------------------------------"
 echo "--- SUCCESS: Your base image is ready ---"
-echo "Next: Flash to SD card using dd"
+echo "Location: $IMG_FILE"
 echo "-------------------------------------------"
