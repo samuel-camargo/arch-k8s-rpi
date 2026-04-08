@@ -51,11 +51,13 @@ docker run --rm --privileged \
     cd /work
     
     echo 'Cleaning up existing mappings...'
+    # Force removal of any existing mappings for this specific file
     kpartx -d $IMG_NAME || true
     
-    # Partitioning
+    # Partitioning (Idempotent)
     if ! fdisk -l $IMG_NAME | grep -q \"${IMG_NAME}1\"; then
         echo 'Partitioning (2GB Boot, Remainder Root)...'
+        # o: MBR, n: new p1, +2G, t: type c (FAT32), n: new p2 (default remainder), w: write
         printf 'o\nn\np\n1\n\n+2G\nt\nc\nn\np\n2\n\n\nw\n' | fdisk $IMG_NAME
         sync
     else
@@ -63,14 +65,17 @@ docker run --rm --privileged \
     fi
 
     echo 'Mapping device partitions...'
-    # Use -as to sync and wait for device nodes
+    # Use -as: 'a' for add, 's' for sync (waits for nodes to appear)
     KOUT=\$(kpartx -asv $IMG_NAME)
     echo \"\$KOUT\"
     
-    # Extract the loop device name (e.g., loop1) from 'add map loop1p1'
-    LOOP_NAME=\$(echo \"\$KOUT\" | head -n 1 | awk '{print \$3}' | sed 's/p[0-9]//g')
-    BOOT_DEV=\"/dev/mapper/\${LOOP_NAME}p1\"
-    ROOT_DEV=\"/dev/mapper/\${LOOP_NAME}p2\"
+    # Extract the exact mapper names from kpartx output
+    # kpartx output looks like: 'add map loopNp1 ...'
+    BOOT_MAPPER=\$(echo \"\$KOUT\" | grep 'p1 ' | awk '{print \$3}')
+    ROOT_MAPPER=\$(echo \"\$KOUT\" | grep 'p2 ' | awk '{print \$3}')
+    
+    BOOT_DEV=\"/dev/mapper/\$BOOT_MAPPER\"
+    ROOT_DEV=\"/dev/mapper/\$ROOT_MAPPER\"
 
     echo \"Formatting \$BOOT_DEV (BOOT) and \$ROOT_DEV (ROOT)...\"
     mkfs.vfat -n BOOT \"\$BOOT_DEV\"
@@ -84,7 +89,7 @@ docker run --rm --privileged \
     
     bsdtar -xpf $ARCH_TARBALL -C /mnt/root
     
-    echo 'Finalizing...'
+    echo 'Finalizing and Unmounting...'
     sync
     umount -R /mnt/root
     kpartx -d $IMG_NAME
