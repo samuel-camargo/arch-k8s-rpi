@@ -4,9 +4,9 @@
 set -e
 
 # --- CONFIGURATION (UPDATE THESE FOR EACH NODE) ---
-HOSTNAME="kube-worker-03"         
-PI_VERSION="4"                    
-STATIC_IP="192.168.1.162/24"      
+HOSTNAME="kube-master-01"         # Update per node
+PI_VERSION="5"                    # 4 or 5
+STATIC_IP="192.168.1.150/24"      # Update per node
 GATEWAY="192.168.1.1"
 WIFI_SSID="YOUR_WIFI_NAME"
 WIFI_PASS="YOUR_WIFI_PASSWORD"
@@ -45,7 +45,7 @@ if [ ! -f "$BASE_IMG" ]; then
     truncate -s 10G "$BASE_IMG"
     docker run --rm --privileged -v "$WORKSPACE":/work ubuntu:22.04 bash -c "
         export DEBIAN_FRONTEND=noninteractive
-        apt-get update -qq && apt-get install -y -qq apt-utils fdisk e2fsprogs dosfstools libarchive-tools kpartx kmod >> /work/build.log 2>&1
+        apt-get update -qq && apt-get install -y -qq fdisk e2fsprogs dosfstools libarchive-tools kpartx kmod >> /work/build.log 2>&1
         cd /work
         for i in {0..63}; do [ ! -b /dev/loop\$i ] && mknod -m 0660 /dev/loop\$i b 7 \$i || true; done
         wipefs -af $BASE_IMG >> /work/build.log 2>&1
@@ -77,9 +77,8 @@ docker run --rm --privileged \
     task() { echo -ne \"\033[1;36m  [⏳]\033[0m \$1... \"; }
     done_task() { echo -e \"\033[1;32mDONE\033[0m\"; }
 
-    apt-get update -qq >> /work/build.log 2>&1 && apt-get install -y -qq apt-utils kpartx curl xz-utils fdisk wget kmod rsync dosfstools e2fsprogs parted >> /work/build.log 2>&1
+    apt-get update -qq >> /work/build.log 2>&1 && apt-get install -y -qq kpartx curl xz-utils fdisk wget kmod rsync dosfstools e2fsprogs parted >> /work/build.log 2>&1
     cd /work
-    rm -f *.pkg.tar.xz*
     for i in {0..63}; do [ ! -b /dev/loop\$i ] && mknod -m 0660 /dev/loop\$i b 7 \$i || true; done
     losetup -D
     
@@ -87,29 +86,29 @@ docker run --rm --privileged \
     LOOP_DEV=\$(losetup -f --show \"\$TARGET_IMG\")
     kpartx -as \"\$LOOP_DEV\"
     LNAME=\$(basename \"\$LOOP_DEV\")
-    MAP_BOOT=\"/dev/mapper/\${LNAME}p1\"
-    MAP_ROOT=\"/dev/mapper/\${LNAME}p2\"
-    sleep 3
-    mkdir -p /mnt/target && mount \"\$MAP_ROOT\" /mnt/target
-    mkdir -p /mnt/target/boot && mount \"\$MAP_BOOT\" /mnt/target/boot
+    mkdir -p /mnt/target && mount \"/dev/mapper/\${LNAME}p2\" /mnt/target
+    mkdir -p /mnt/target/boot && mount \"/dev/mapper/\${LNAME}p1\" /mnt/target/boot
     rm -rf /mnt/target/boot/*
     done_task
 
-    task 'Enabling Root SSH & MOTD'
-    # Allow root login and set password to 'root'
+    task 'Enabling Root SSH & Tool Configs'
     sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/' /mnt/target/etc/ssh/sshd_config
-    sed -i 's/^#PrintMotd.*/PrintMotd yes/' /mnt/target/etc/ssh/sshd_config
     echo 'root:root' | chroot /mnt/target chpasswd
+    cat <<EOF_CRI > /mnt/target/etc/crictl.yaml
+runtime-endpoint: unix:///run/containerd/containerd.sock
+image-endpoint: unix:///run/containerd/containerd.sock
+timeout: 2
+debug: false
+EOF_CRI
     done_task
 
-    task 'Injecting Ultimate Provisioning (v23)'
+    task 'Injecting Ultimate Provisioning (v24)'
     cat <<'EOF_PROV' > /mnt/target/usr/local/bin/rpi-provision.sh
 #!/bin/bash
 set -e
 
 LOG=\"/var/log/provision.log\"
-touch \$LOG
-chmod 644 \$LOG # Allow 'alarm' user to read progress
+touch \$LOG && chmod 644 \$LOG
 exec > >(tee -a \"\$LOG\") 2>&1
 
 log_prov() {
@@ -126,7 +125,7 @@ pacman_retry() {
         else
             if [[ \$n -lt \$max ]]; then
                 ((n++))
-                log_prov \"⚠️ Mirror Timeout. Retrying (\$n/\$max) in \$delay seconds...\"
+                log_prov \"⚠️ Mirror Timeout. Retrying (\$n/\$max)...\"
                 sleep \$delay
                 pacman -Syy
             else
@@ -163,11 +162,12 @@ net.ipv4.ip_forward                 = 1
 EOF_SYS
 sysctl --system
 
-log_prov \"🏗️ (Step 5/7) Installing K8s Tools...\"
-pacman_retry pacman -S --noconfirm containerd kubeadm kubelet kubectl runc
+log_prov \"🏗️ (Step 5/7) Installing K8s & Storage Tools...\"
+# Added open-iscsi and nfs-utils for Longhorn
+pacman_retry pacman -S --noconfirm containerd kubeadm kubelet kubectl runc open-iscsi nfs-utils
 mkdir -p /etc/containerd && containerd config default > /etc/containerd/config.toml
 sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
-systemctl enable --now containerd kubelet
+systemctl enable --now containerd kubelet iscsid
 
 log_prov \"💾 (Step 6/7) Expanding Filesystem...\"
 ROOT_DEV=\$(findmnt / -o SOURCE -n)
@@ -199,20 +199,16 @@ EOF
 
     task 'Fetching Drivers'
     K_MIRROR=\"http://fl.us.mirror.archlinuxarm.org/aarch64\"
-    if [ \"\$PI_VERSION\" == \"4\" ]; then
-        K_PKG=\$(curl -sL \$K_MIRROR/core/ | grep -oE 'linux-rpi-[0-9][^[:space:]\"]+\.pkg\.tar\.xz' | grep -v '16k' | grep -v 'headers' | sort -V | tail -n 1)
-        DTB=\"bcm2711-rpi-4-b.dtb\"
-    else
-        K_PKG=\$(curl -sL \$K_MIRROR/core/ | grep -oE 'linux-rpi-[0-9][^[:space:]\"]+\.pkg\.tar\.xz' | grep -v '16k' | grep -v 'headers' | sort -V | tail -n 1)
-        DTB=\"bcm2712-rpi-5-b.dtb\"
-    fi
+    K_PKG=\$(curl -sL \$K_MIRROR/core/ | grep -oE 'linux-rpi-[0-9][^[:space:]\"]+\.pkg\.tar\.xz' | grep -v '16k' | grep -v 'headers' | sort -V | tail -n 1)
+    DTB=\"bcm2711-rpi-4-b.dtb\"
+    [ \"\$PI_VERSION\" == \"5\" ] && DTB=\"bcm2712-rpi-5-b.dtb\"
     REG=\$(curl -sL \$K_MIRROR/core/ | grep -oE 'wireless-regdb-[^[:space:]\"]+\.pkg\.tar\.xz' | head -n 1)
     BOOT=\$(curl -sL \$K_MIRROR/alarm/ | grep -oE 'raspberrypi-bootloader-[^[:space:]\"]+\.pkg\.tar\.xz' | tail -n 1)
     FIRM=\$(curl -sL \$K_MIRROR/alarm/ | grep -oE 'firmware-raspberrypi-[^[:space:]\"]+\.pkg\.tar\.xz' | tail -n 1)
     wget -q \"\$K_MIRROR/core/\$K_PKG\" \"\$K_MIRROR/core/\$REG\" \"\$K_MIRROR/alarm/\$BOOT\" \"\$K_MIRROR/alarm/\$FIRM\"
     done_task
 
-    task 'Extracting & Finalizing'
+    task 'Finalizing Build'
     tar -xpf \"\$K_PKG\" -C /mnt/target >> /work/build.log 2>&1
     tar -xpf \"\$REG\" -C /mnt/target >> /work/build.log 2>&1
     tar -xpf \"\$BOOT\" -C /mnt/target >> /work/build.log 2>&1
@@ -245,4 +241,3 @@ DURATION=$((SECONDS - START_TIME))
 log_header "BUILD COMPLETE"
 log_success "Target:    ${B_GREEN}$TARGET_IMG${NC}"
 log_success "Time:      ${B_YELLOW}$((DURATION / 60))m $((DURATION % 60))s${NC}"
-echo -e "\n${B_MAGENTA}=======================================================${NC}"
