@@ -1,11 +1,10 @@
 #!/bin/bash
-# Stop script on any error
 set -e
 
-# --- CONFIGURATION (UPDATE THESE FOR EACH NODE) ---
-HOSTNAME="kube-worker-04"         # Update per node
-PI_VERSION="3"                    # Supports "3", "4", or "5"
-STATIC_IP="192.168.1.163/24"      
+# --- CONFIGURATION (Supports 3, 4, 5) ---
+HOSTNAME="kube-master-03"         # Suggesting Master-03 for Quorum!
+PI_VERSION="3"                    
+STATIC_IP="192.168.1.152/24"      
 GATEWAY="192.168.1.1"
 WIFI_SSID="YOUR_WIFI_NAME"
 WIFI_PASS="YOUR_WIFI_PASSWORD"
@@ -37,20 +36,17 @@ mkdir -p "$WORKSPACE"
 echo "--- Build Log Started $(date) ---" > "$LOG_FILE"
 cd "$WORKSPACE"
 
-# =========================================================
-# PHASE 1: BASE IMAGE VERIFICATION
-# =========================================================
+# PHASE 1: VERIFICATION
 log_header "PHASE 1: BASE ARCHITECTURE"
-
 if [ ! -f "$ARCH_TARBALL" ]; then
-    log_step "Arch Linux ARM Tarball missing. Downloading..."
+    log_step "Downloading aarch64 Tarball..."
     wget -c -O "$ARCH_TARBALL" "http://os.archlinuxarm.org/os/$ARCH_TARBALL" >> "$LOG_FILE" 2>&1
 else
-    log_success "Tarball found ($ARCH_TARBALL). Skipping download."
+    log_success "Tarball found. RPi 3, 4, and 5 all share the aarch64 base."
 fi
 
 if [ ! -f "$BASE_IMG" ]; then
-    log_step "Base Image missing. Building 10GB Arch-Base..."
+    log_step "Building 10GB Base Image..."
     truncate -s 10G "$BASE_IMG"
     docker run --rm --privileged -v "$WORKSPACE":/work ubuntu:22.04 bash -c "
         export DEBIAN_FRONTEND=noninteractive
@@ -69,16 +65,12 @@ if [ ! -f "$BASE_IMG" ]; then
         bsdtar -xpf $ARCH_TARBALL -C /mnt/root
         sync && umount -R /mnt/root && kpartx -d \"\$LOOP\" && losetup -d \"\$LOOP\"
     " || log_error "Base build failed."
-    log_success "Base image generated successfully."
 else
-    log_success "Existing base image found ($BASE_IMG). Reusing."
+    log_success "Existing base image found. Reusing."
 fi
 
-# =========================================================
 # PHASE 2: CUSTOMIZATION
-# =========================================================
 log_header "PHASE 2: KUBE-NODE HARDENING (RPi $PI_VERSION)"
-log_step "Cloning base image to $TARGET_IMG..."
 cp "$BASE_IMG" "$TARGET_IMG"
 
 docker run --rm --privileged \
@@ -91,14 +83,12 @@ docker run --rm --privileged \
     export DEBIAN_FRONTEND=noninteractive
     task() { echo -ne \"\033[1;36m  [⏳]\033[0m \$1... \"; }
     done_task() { echo -e \"\033[1;32mDONE\033[0m\"; }
-
     apt-get update -qq && apt-get install -y -qq kpartx curl xz-utils fdisk wget kmod rsync dosfstools e2fsprogs parted > /dev/null 2>&1
     
     cd /work
     for i in {0..63}; do [ ! -b /dev/loop\$i ] && mknod -m 0660 /dev/loop\$i b 7 \$i || true; done
-    losetup -D
     
-    task 'Mounting Filesystems'
+    task 'Mounting'
     LOOP_DEV=\$(losetup -f --show \"\$TARGET_IMG\")
     kpartx -as \"\$LOOP_DEV\"
     LNAME=\$(basename \"\$LOOP_DEV\")
@@ -107,7 +97,7 @@ docker run --rm --privileged \
     rm -rf /mnt/target/boot/*
     done_task
 
-    task 'Security & crictl'
+    task 'Security'
     echo 'root:root' | chroot /mnt/target chpasswd
     sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/' /mnt/target/etc/ssh/sshd_config
     cat <<EOF_CRI > /mnt/target/etc/crictl.yaml
@@ -117,7 +107,7 @@ timeout: 10
 EOF_CRI
     done_task
 
-    task 'Injecting Universal Provisioning (v30)'
+    task 'Injecting Provisioning'
     cat <<'EOF_PROV' > /mnt/target/usr/local/bin/rpi-provision.sh
 #!/bin/bash
 set -e
@@ -133,17 +123,15 @@ log_prov() {
 }
 
 pacman_retry() {
-    local n=1; local max=5; local delay=10
+    local n=1; local max=5
     while true; do
-        log_prov \"🎬 Executing: \$*\"
         if yes | \"\$@\" >> /var/log/provision.log 2>&1; then break;
         else
             if [[ \$n -lt \$max ]]; then
                 ((n++))
-                log_prov \"⚠️ Retry \$n/\$max...\"
                 rm -f /var/lib/pacman/db.lck
                 pacman -Sy >> /var/log/provision.log 2>&1 || true
-                sleep \$delay
+                sleep 10
             else
                 exit 1
             fi
@@ -151,7 +139,7 @@ pacman_retry() {
     done
 }
 
-log_prov \"🚀 PROVISIONING START\"
+log_prov \"🚀 START\"
 for i in {1..30}; do ping -c 1 -W 1 8.8.8.8 &>/dev/null && break || sleep 2; done
 
 log_prov \"🔑 (1/5) Keys...\"
@@ -159,10 +147,9 @@ pacman-key --init && pacman-key --populate archlinuxarm
 pacman_retry pacman -Sy archlinux-keyring --noconfirm
 
 log_prov \"📦 (2/5) Update...\"
-sed -i 's/#ParallelDownloads = 5/ParallelDownloads = 10/' /etc/pacman.conf
 pacman_retry pacman -Syu --noconfirm
 
-log_prov \"🏗️ (3/5) K8s & Storage...\"
+log_prov \"🏗️ (3/5) K8s...\"
 pacman_retry pacman -S --noconfirm containerd kubeadm kubelet kubectl runc open-iscsi nfs-utils
 mkdir -p /etc/containerd && containerd config default > /etc/containerd/config.toml
 sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
@@ -205,7 +192,7 @@ EOF
     K_MIRROR=\"http://fl.us.mirror.archlinuxarm.org/aarch64\"
     K_PKG=\$(curl -sL \$K_MIRROR/core/ | grep -oE 'linux-rpi-[0-9][^[:space:]\"]+\.pkg\.tar\.xz' | grep -v '16k' | grep -v 'headers' | sort -V | tail -n 1)
     
-    # --- Universal DTB Selection ---
+    # Universal DTB Selection
     DTB=\"bcm2711-rpi-4-b.dtb\"
     [ \"\$PI_VERSION\" == \"5\" ] && DTB=\"bcm2712-rpi-5-b.dtb\"
     [ \"\$PI_VERSION\" == \"3\" ] && DTB=\"bcm2710-rpi-3-b.dtb\"
@@ -215,7 +202,7 @@ EOF
     wget -q \"\$K_MIRROR/core/\$K_PKG\" \"\$K_MIRROR/alarm/\$BOOT\" \"\$K_MIRROR/alarm/\$FIRM\"
     done_task
 
-    task 'Finalizing Image'
+    task 'Finalizing'
     tar -xpf \"\$K_PKG\" -C /mnt/target >> /work/build.log 2>&1
     tar -xpf \"\$BOOT\" -C /mnt/target >> /work/build.log 2>&1
     tar -xpf \"\$FIRM\" -C /mnt/target >> /work/build.log 2>&1
@@ -235,18 +222,16 @@ EOF
     ln -sf /usr/lib/systemd/system/systemd-networkd.service /mnt/target/etc/systemd/system/multi-user.target.wants/systemd-networkd.service
     
     echo -e \"arm_64bit=1\nkernel=Image\ndevice_tree=\$DTB\nusb_max_current_enable=1\" > /mnt/target/boot/config.txt
-    echo \"root=/dev/mmcblk0p2 rw rootwait console=tty1 selinux=0 net.ifnames=0\" > /mnt/target/boot/cmdline.txt
+    # Added cma=128M for better memory allocation on RPi 3
+    echo \"root=/dev/mmcblk0p2 rw rootwait console=tty1 selinux=0 net.ifnames=0 cma=128M\" > /mnt/target/boot/cmdline.txt
     
     sync && umount -R /mnt/target && kpartx -d \"\$LOOP_DEV\" >> /work/build.log 2>&1 && losetup -d \"\$LOOP_DEV\"
     done_task
 " || log_error "Build failed."
 
-# =========================================================
-# FINAL SUMMARY
-# =========================================================
+# --- FINAL SUMMARY ---
 DURATION=$((SECONDS - START_TIME))
 log_header "BUILD COMPLETE"
 log_success "Target:    ${B_GREEN}$TARGET_IMG${NC}"
 log_success "Time:      ${B_YELLOW}$((DURATION / 60))m $((DURATION % 60))s${NC}"
 log_success "Command:   ${B_CYAN}sudo dd if=$TARGET_IMG of=/dev/rdiskX bs=4M status=progress${NC}"
-echo -e "\n${B_MAGENTA}=======================================================${NC}"
