@@ -7,7 +7,6 @@ set -e
 WORKSPACE="$HOME/rpi_arch_build"
 BASE_IMG="rpi_arch_base.img"
 RPI5_IMG="rpi5_master.img"
-# Using a specific mirror IP/Domain that is generally stable
 MIRROR="http://mirror.archlinuxarm.org/aarch64/alarm"
 
 # Colors
@@ -33,7 +32,6 @@ cp "$BASE_IMG" "$RPI5_IMG"
 log "Cloned $BASE_IMG to $RPI5_IMG."
 
 log "Step 2: Launching Docker for Offline Injection"
-# Added --dns 8.8.8.8 to bypass potential Docker Desktop DNS lag
 docker run --rm --privileged \
     --dns 8.8.8.8 \
     -v "$WORKSPACE":/work \
@@ -46,37 +44,43 @@ docker run --rm --privileged \
 
     cd /work
     
-    echo 'Checking mirror connectivity (with retries)...'
-    # More resilient check: try to fetch just the first 10 lines of the index
-    if ! curl -s --connect-timeout 5 $MIRROR/ | head -n 5 > /dev/null; then
-        echo 'ERROR: Cannot reach Arch Linux ARM mirror. Check your Mac internet or VPN.'
-        exit 1
-    fi
-
     echo 'Discovering latest RPi 5 packages...'
+    # Scrape the mirror - simplified to just look for filenames ending in .zst
     HTML_LIST=\$(curl -sL $MIRROR/)
     
-    GET_LATEST() {
-        echo \"\$HTML_LIST\" | grep -oE \"\$1-[0-9][a-zA-Z0-9._-]+-aarch64\.pkg\.tar\.zst|\$1-[0-9][a-zA-Z0-9._-]+-any\.pkg\.tar\.zst\" | sort -V | tail -n 1
-    }
+    # New discovery logic: 
+    # 1. Finds all text inside href=\"...\"
+    # 2. Filters by the specific package name
+    # 3. Sorts and picks the latest
+    KERNEL_PKG=\$(echo \"\$HTML_LIST\" | grep -oE 'linux-rpi-[^[:space:]\"]+\.pkg\.tar\.zst' | sort -V | tail -n 1)
+    BOOT_PKG=\$(echo \"\$HTML_LIST\" | grep -oE 'raspberrypi-bootloader-[^[:space:]\"]+\.pkg\.tar\.zst' | sort -V | tail -n 1)
+    FIRM_PKG=\$(echo \"\$HTML_LIST\" | grep -oE 'raspberrypi-firmware-[^[:space:]\"]+\.pkg\.tar\.zst' | sort -V | tail -n 1)
 
-    KERNEL_PKG=\$(GET_LATEST \"linux-rpi\")
-    BOOT_PKG=\$(GET_LATEST \"raspberrypi-bootloader\")
-    FIRM_PKG=\$(GET_LATEST \"raspberrypi-firmware\")
+    echo \"Found Kernel: \$KERNEL_PKG\"
+    echo \"Found Bootloader: \$BOOT_PKG\"
+    echo \"Found Firmware: \$FIRM_PKG\"
 
-    echo \"Found: \$KERNEL_PKG, \$BOOT_PKG, \$FIRM_PKG\"
+    # Validation: Stop if discovery failed
+    if [ -z \"\$KERNEL_PKG\" ] || [ -z \"\$BOOT_PKG\" ] || [ -z \"\$FIRM_PKG\" ]; then
+        echo 'ERROR: Discovery failed. The mirror format might have changed.'
+        exit 1
+    fi
 
     PKGS=(\"\$KERNEL_PKG\" \"\$BOOT_PKG\" \"\$FIRM_PKG\")
     for pkg in \"\${PKGS[@]}\"; do
         if [ ! -f \"\$pkg\" ]; then
             echo \"Downloading \$pkg...\"
             wget --show-progress -q \"$MIRROR/\$pkg\"
+        else
+            echo \"\$pkg already present.\"
         fi
     done
 
     echo 'Mapping image partitions...'
     kpartx -d $RPI5_IMG || true
     KOUT=\$(kpartx -asv $RPI5_IMG)
+    echo \"\$KOUT\"
+    
     BOOT_MAPPER=\$(echo \"\$KOUT\" | grep 'p1 ' | awk '{print \$3}')
     ROOT_MAPPER=\$(echo \"\$KOUT\" | grep 'p2 ' | awk '{print \$3}')
     
@@ -85,27 +89,22 @@ docker run --rm --privileged \
     mkdir -p /mnt/root/boot
     mount \"/dev/mapper/\$BOOT_MAPPER\" /mnt/root/boot
 
-    echo 'Injecting Kernel/Firmware and enabling Headless Access...'
+    echo 'Injecting Kernel/Firmware...'
     for pkg in \"\${PKGS[@]}\"; do
+        echo \"Extracting \$pkg...\"
         tar --zstd -xpf \"\$pkg\" -C /mnt/root --exclude='.PKGINFO' --exclude='.MTREE' --exclude='.INSTALL'
     done
 
-    # --- Headless Configuration ---
-    # 1. Enable SSH at boot
+    # --- Headless Config (SSH/Root) ---
+    echo 'Enabling Headless Access...'
     ln -sf /usr/lib/systemd/system/sshd.service /mnt/root/etc/systemd/system/multi-user.target.wants/sshd.service
-    
-    # 2. Permit Root Login via SSH
     sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /mnt/root/etc/ssh/sshd_config
     
-    # 3. Setup SSH key for root (if your Mac has one)
-    mkdir -p /mnt/root/root/.ssh
-    chmod 700 /mnt/root/root/.ssh
-    if [ -f /work/id_rsa.pub ]; then
-        cp /work/id_rsa.pub /mnt/root/root/.ssh/authorized_keys
-    elif [ -f /work/id_ed25519.pub ]; then
-        cp /work/id_ed25519.pub /mnt/root/root/.ssh/authorized_keys
-    fi
-    # ------------------------------
+    # Inject SSH key for root if it exists in the work dir
+    mkdir -p /mnt/root/root/.ssh && chmod 700 /mnt/root/root/.ssh
+    [ -f /work/id_rsa.pub ] && cp /work/id_rsa.pub /mnt/root/root/.ssh/authorized_keys
+    [ -f /work/id_ed25519.pub ] && cp /work/id_ed25519.pub /mnt/root/root/.ssh/authorized_keys
+    [ -f /mnt/root/root/.ssh/authorized_keys ] && chmod 600 /mnt/root/root/.ssh/authorized_keys
 
     echo 'Finalizing boot files...'
     cat <<EOF > /mnt/root/etc/fstab
