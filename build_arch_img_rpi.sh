@@ -3,10 +3,10 @@
 # Stop script on any error
 set -e
 
-# --- CONFIGURATION (UPDATE THESE FOR EACH RUN) ---
-HOSTNAME="kube-master-02"         # master-01, master-02, worker-01, worker-02, worker-03
-PI_VERSION="5"                    # 4 for RPi4, 5 for RPi5
-STATIC_IP="192.168.1.151/24"      # Master IPs: .150, .151 | Worker IPs: .160, .161, .162
+# --- CONFIGURATION (UPDATE THESE FOR EACH NODE) ---
+HOSTNAME="kube-worker-02"         # Name: master-01, master-02, worker-01, etc.
+PI_VERSION="4"                    # Hardware: 4 or 5
+STATIC_IP="192.168.1.161/24"      # IPs: .150 (M1), .151 (M2), .160 (W1), .161 (W2)...
 GATEWAY="192.168.1.1"
 WIFI_SSID="YOUR_WIFI_NAME"
 WIFI_PASS="YOUR_WIFI_PASSWORD"
@@ -63,7 +63,7 @@ if [ ! -f "$BASE_IMG" ]; then
 fi
 
 # =========================================================
-# PHASE 2: CUSTOMIZING FOR $HOSTNAME
+# PHASE 2: HARDWARE-SPECIFIC CUSTOMIZATION
 # =========================================================
 log_header "PHASE 2: CUSTOMIZING $HOSTNAME (RPi $PI_VERSION)"
 cp "$BASE_IMG" "$TARGET_IMG"
@@ -81,7 +81,7 @@ docker run --rm --privileged \
 
     apt-get update -qq > /dev/null && apt-get install -y -qq apt-utils kpartx curl xz-utils fdisk wget kmod rsync dosfstools e2fsprogs parted > /dev/null 2>&1
     cd /work
-    rm -f *.pkg.tar.xz*
+    rm -f *.pkg.tar.xz* # Prevent duplicate extraction errors
     for i in {0..63}; do [ ! -b /dev/loop\$i ] && mknod -m 0660 /dev/loop\$i b 7 \$i || true; done
     losetup -D
     
@@ -94,29 +94,52 @@ docker run --rm --privileged \
     rm -rf /mnt/target/boot/*
     succ
 
-    task 'Injecting Provisioning'
+    task 'Injecting Total Provisioning (v18)'
     cat <<'EOF_PROV' > /mnt/target/usr/local/bin/rpi-provision.sh
 #!/bin/bash
 iw dev wlan0 set power_save off || true
-echo \"[PROV] Waiting for Google...\"
+echo \"[PROV] Waiting for Internet...\"
 while ! ping -c 1 -W 2 8.8.8.8 &>/dev/null; do sleep 3; done
+
+# 1. Keyring & Update
 pacman-key --init && pacman-key --populate archlinuxarm
 pacman -Sy archlinux-keyring --noconfirm
 sed -i 's/#ParallelDownloads = 5/ParallelDownloads = 10/' /etc/pacman.conf
 pacman -Syu --noconfirm
+
+# 2. System Prep (Time & Swap)
 timedatectl set-ntp true
 swapoff -a && sed -i '/swap/d' /etc/fstab
+
+# 3. CRITICAL: Force Kernel Modules & Sysctl for CNI/Flannel
+mkdir -p /etc/modules-load.d
+echo -e \"overlay\nbr_netfilter\" > /etc/modules-load.d/k8s.conf
+modprobe overlay || true
+modprobe br_netfilter || true
+
+mkdir -p /etc/sysctl.d
+cat <<EOF > /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+EOF
+sysctl --system
+
+# 4. K8s Stack & Containerd Config
 pacman -S --noconfirm containerd kubeadm kubelet kubectl runc
 mkdir -p /etc/containerd
 containerd config default > /etc/containerd/config.toml
 sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
 systemctl enable --now containerd kubelet
+
+# 5. Partition Expand
 ROOT_DEV=\$(findmnt / -o SOURCE -n)
 DISK_DEV=\${ROOT_DEV%p*}
 PART_NUM=\$(echo \$ROOT_DEV | grep -o '[0-9]\$')
 echo -e \"d\n\$PART_NUM\nn\np\n\$PART_NUM\n\n\ny\nw\" | fdisk \$DISK_DEV > /dev/null 2>&1
 partx -u \$DISK_DEV || true
 resize2fs \$ROOT_DEV > /dev/null 2>&1
+
 systemctl disable rpi-provision.service
 rm /etc/systemd/system/rpi-provision.service
 EOF_PROV
@@ -124,7 +147,7 @@ EOF_PROV
     
     cat <<EOF > /mnt/target/etc/systemd/system/rpi-provision.service
 [Unit]
-Description=K8s Provisioning
+Description=K8s Automated Provisioning
 After=network-online.target
 [Service]
 Type=oneshot
@@ -135,7 +158,7 @@ EOF
     ln -sf /etc/systemd/system/rpi-provision.service /mnt/target/etc/systemd/system/multi-user.target.wants/rpi-provision.service
     succ
 
-    task \"Patching Drivers for RPi \$PI_VERSION\"
+    task \"Downloading Drivers (RPi \$PI_VERSION)\"
     K_MIRROR=\"http://fl.us.mirror.archlinuxarm.org/aarch64\"
     if [ \"\$PI_VERSION\" == \"4\" ]; then
         KERNEL_PKG=\$(curl -sL \$K_MIRROR/core/ | grep -oE 'linux-rpi-[0-9][^[:space:]\"]+\.pkg\.tar\.xz' | grep -v '16k' | grep -v 'headers' | sort -V | tail -n 1)
@@ -150,14 +173,14 @@ EOF
 
     wget -q \"\$K_MIRROR/core/\$KERNEL_PKG\" \"\$K_MIRROR/core/\$REGDB\" \"\$K_MIRROR/alarm/\$BOOT\" \"\$K_MIRROR/alarm/\$FIRM\"
     tar -xpf \"\$KERNEL_PKG\" -C /mnt/target
-    tar -xpf \"wireless-regdb\"* -C /mnt/target
-    tar -xpf \"raspberrypi-bootloader\"* -C /mnt/target
-    tar -xpf \"firmware-raspberrypi\"* -C /mnt/target
+    tar -xpf \"\$REGDB\" -C /mnt/target
+    tar -xpf \"\$BOOT\" -C /mnt/target
+    tar -xpf \"\$FIRM\" -C /mnt/target
     [ -d /mnt/target/boot/boot ] && mv /mnt/target/boot/boot/* /mnt/target/boot/ && rmdir /mnt/target/boot/boot
     depmod -b /mnt/target \$(ls /mnt/target/usr/lib/modules | head -n 1)
     succ
 
-    task 'Finalizing Setup'
+    task 'Finalizing Network & Boot'
     echo \"\$HOSTNAME\" > /mnt/target/etc/hostname
     cat <<EOF > /mnt/target/etc/systemd/network/25-wireless.network
 [Match]
@@ -180,6 +203,7 @@ EOF
 " || log_error "Customization Failed"
 
 log_header "SUCCESS: READY TO FLASH $HOSTNAME"
+echo -e "Node:     ${B_GREEN}$HOSTNAME${NC} (RPi $PI_VERSION)"
 echo -e "IP:       ${B_GREEN}$STATIC_IP${NC}"
 echo -e "Flash:    ${B_CYAN}sudo dd if=$TARGET_IMG of=/dev/diskX bs=4M status=progress${NC}"
 log_header "========================================"
