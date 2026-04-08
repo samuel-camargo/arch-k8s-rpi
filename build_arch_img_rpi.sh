@@ -1,102 +1,66 @@
 #!/bin/bash
 
-# Stop script on any error
 set -e
 
 # --- Configuration ---
 WORKSPACE="$HOME/rpi_arch_build"
-IMG_NAME="rpi_arch_base.img"
-IMG_FILE="$WORKSPACE/$IMG_NAME"
-ARCH_TARBALL="ArchLinuxARM-rpi-aarch64-latest.tar.gz"
-DOWNLOAD_URL="http://os.archlinuxarm.org/os/$ARCH_TARBALL"
-# 7GB (2GB Boot + ~4.5GB Root + overhead)
-IMG_SIZE="7G" 
+BASE_IMG="rpi_arch_base.img"
+RPI5_IMG="rpi5_master.img"
 
-mkdir -p "$WORKSPACE"
 cd "$WORKSPACE"
 
-# 1. Idempotent Download
-echo "--- Step 1: Checking ALARM Image ---"
-if [ ! -f "$ARCH_TARBALL" ]; then
-    echo "Downloading Arch Linux ARM..."
-    wget -c "$DOWNLOAD_URL"
+echo "--- Step 1: Cloning Base Image for RPi 5 ---"
+if [ ! -f "$RPI5_IMG" ]; then
+    cp "$BASE_IMG" "$RPI5_IMG"
+    echo "Created $RPI5_IMG."
 else
-    echo "Image already downloaded. Skipping."
+    echo "$RPI5_IMG already exists. Patching existing file."
 fi
 
-# 2. Idempotent Image File Creation & Validation
-echo "--- Step 2: Validating Image File ---"
-if [ ! -f "$IMG_FILE" ]; then
-    echo "Creating new $IMG_SIZE image file..."
-    truncate -s "$IMG_SIZE" "$IMG_FILE"
-else
-    echo "File exists. Checking for partition table..."
-    if file "$IMG_FILE" | grep -q "boot sector"; then
-        echo "Valid partition table found."
-    else
-        echo "File is blank. Initializing..."
-        truncate -s "$IMG_SIZE" "$IMG_FILE"
-    fi
-fi
-
-# 3. Docker "Transplant" Operation
-echo "--- Step 3: Running Linux Container ---"
+echo "--- Step 2: Patching Kernel for RPi 5 (via Docker + QEMU) ---"
 docker run --rm --privileged \
     -v "$WORKSPACE":/work \
+    -v /usr/bin/qemu-aarch64-static:/usr/bin/qemu-aarch64-static \
     ubuntu:latest bash -c "
     set -e
-    echo 'Installing dependencies...'
-    apt-get update -qq && apt-get install -y -qq fdisk e2fsprogs dosfstools libarchive-tools kpartx > /dev/null
+    apt-get update -qq && apt-get install -y -qq kpartx libarchive-tools qemu-user-static > /dev/null
 
     cd /work
+    kpartx -d $RPI5_IMG || true
+    KOUT=\$(kpartx -asv $RPI5_IMG)
     
-    echo 'Cleaning up existing mappings...'
-    # Force removal of any existing mappings for this specific file
-    kpartx -d $IMG_NAME || true
-    
-    # Partitioning (Idempotent)
-    if ! fdisk -l $IMG_NAME | grep -q \"${IMG_NAME}1\"; then
-        echo 'Partitioning (2GB Boot, Remainder Root)...'
-        # o: MBR, n: new p1, +2G, t: type c (FAT32), n: new p2 (default remainder), w: write
-        printf 'o\nn\np\n1\n\n+2G\nt\nc\nn\np\n2\n\n\nw\n' | fdisk $IMG_NAME
-        sync
-    else
-        echo 'Partition table already exists.'
-    fi
-
-    echo 'Mapping device partitions...'
-    # Use -as: 'a' for add, 's' for sync (waits for nodes to appear)
-    KOUT=\$(kpartx -asv $IMG_NAME)
-    echo \"\$KOUT\"
-    
-    # Extract the exact mapper names from kpartx output
-    # kpartx output looks like: 'add map loopNp1 ...'
     BOOT_MAPPER=\$(echo \"\$KOUT\" | grep 'p1 ' | awk '{print \$3}')
     ROOT_MAPPER=\$(echo \"\$KOUT\" | grep 'p2 ' | awk '{print \$3}')
     
-    BOOT_DEV=\"/dev/mapper/\$BOOT_MAPPER\"
-    ROOT_DEV=\"/dev/mapper/\$ROOT_MAPPER\"
+    mkdir -p /mnt/rpi5
+    mount \"/dev/mapper/\$ROOT_MAPPER\" /mnt/rpi5
+    mount \"/dev/mapper/\$BOOT_MAPPER\" /mnt/rpi5/boot
 
-    echo \"Formatting \$BOOT_DEV (BOOT) and \$ROOT_DEV (ROOT)...\"
-    mkfs.vfat -n BOOT \"\$BOOT_DEV\"
-    mkfs.ext4 -F -L ROOT \"\$ROOT_DEV\"
-    
-    echo 'Extracting Arch Linux ARM (this takes a minute)...'
-    mkdir -p /mnt/root
-    mount \"\$ROOT_DEV\" /mnt/root
-    mkdir -p /mnt/root/boot
-    mount \"\$BOOT_DEV\" /mnt/root/boot
-    
-    bsdtar -xpf $ARCH_TARBALL -C /mnt/root
-    
-    echo 'Finalizing and Unmounting...'
+    echo 'Entering Chroot to swap kernels...'
+    # Use systemd-nspawn or chroot with QEMU to run ARM pacman
+    # We initialize the pacman keys and swap the kernel
+    chroot /mnt/rpi5 /usr/bin/bash -c \"
+        # Initialize pacman keys
+        pacman-key --init
+        pacman-key --populate archlinuxarm
+        
+        # Remove generic kernel and install RPi specific kernel
+        # --noconfirm makes it idempotent/scriptable
+        pacman -R --noconfirm linux-aarch64 || true
+        pacman -Syu --noconfirm linux-rpi raspberrypi-bootloader raspberrypi-firmware
+    \"
+
+    echo 'Updating fstab for RPi boot...'
+    # Ensure /boot points to the correct partition
+    echo '/dev/mmcblk0p1  /boot   vfat    defaults        0       0' > /mnt/rpi5/etc/fstab
+    echo '/dev/mmcblk0p2  /       ext4    defaults,noatime  0       1' >> /mnt/rpi5/etc/fstab
+
     sync
-    umount -R /mnt/root
-    kpartx -d $IMG_NAME
-    echo 'Container work complete.'
+    umount -R /mnt/rpi5
+    kpartx -d $RPI5_IMG
 "
 
-echo "-------------------------------------------"
-echo "--- SUCCESS: Your base image is ready ---"
-echo "Location: $IMG_FILE"
-echo "-------------------------------------------"
+echo "------------------------------------------------"
+echo "--- SUCCESS: RPi 5 Master Image is Ready ---"
+echo "Location: $WORKSPACE/$RPI5_IMG"
+echo "------------------------------------------------"
