@@ -9,7 +9,7 @@ IMG_NAME="rpi_arch_base.img"
 IMG_FILE="$WORKSPACE/$IMG_NAME"
 ARCH_TARBALL="ArchLinuxARM-rpi-aarch64-latest.tar.gz"
 DOWNLOAD_URL="http://os.archlinuxarm.org/os/$ARCH_TARBALL"
-# Increased image size to 6GB to accommodate the 2GB boot partition + rootfs
+# 6GB: 2GB Boot + ~3.5GB Root + overhead
 IMG_SIZE="6G" 
 
 mkdir -p "$WORKSPACE"
@@ -24,44 +24,67 @@ else
     echo "Image already downloaded. Skipping."
 fi
 
-# 2. Create Base Image (if not exists)
-echo "--- Step 2: Creating Sparse Image ---"
+# 2. Idempotent Image File Creation
+echo "--- Step 2: Validating Image File ---"
 if [ ! -f "$IMG_FILE" ]; then
-    echo "Creating $IMG_SIZE image file..."
+    echo "Creating new $IMG_SIZE image file..."
     truncate -s "$IMG_SIZE" "$IMG_FILE"
 else
-    echo "Image file $IMG_NAME already exists. Skipping creation."
+    echo "File exists. Checking if it's a valid partitioned image..."
+    # We use 'file' to see if there's a partition table. 
+    # Blank files show as 'data'. Partitioned images show 'DOS/MBR boot sector'
+    if file "$IMG_FILE" | grep -q "boot sector"; then
+        echo "Valid partition table found. Keeping existing file."
+    else
+        echo "File is blank or invalid. Re-creating..."
+        rm "$IMG_FILE"
+        truncate -s "$IMG_SIZE" "$IMG_FILE"
+    fi
 fi
 
 # 3. Docker "Transplant" Operation
-echo "--- Step 3: Running Linux Container to prepare OS ---"
-# We pass the filename only, as the path inside the container is /work/
+echo "--- Step 3: Running Linux Container ---"
 docker run --rm --privileged \
     -v "$WORKSPACE":/work \
     ubuntu:latest bash -c "
     set -e
-    echo 'Installing dependencies inside container...'
+    echo 'Installing dependencies (parted, fdisk, etc.)...'
     apt-get update -qq
-    apt-get install -y -qq fdisk e2fsprogs dosfstools libarchive-tools > /dev/null
+    apt-get install -y -qq fdisk e2fsprogs dosfstools libarchive-tools parted > /dev/null
 
     cd /work
     
     echo 'Setting up loop device...'
-    # Detach any existing loop devices for this file first to ensure idempotency
-    EXISTING_LOOP=\$(losetup -j $IMG_NAME | cut -d ':' -f1)
-    for l in \$EXISTING_LOOP; do losetup -d \$l; done
+    # Clean up any old loops to prevent 'Device Busy' errors
+    EXISTING_LOOPS=\$(losetup -j $IMG_NAME | cut -d ':' -f1)
+    for l in \$EXISTING_LOOPS; do losetup -d \$l; done
     
     LOOP_DEV=\$(losetup -fP --show $IMG_NAME)
     echo \"Loop device created at \$LOOP_DEV\"
 
-    # Idempotent Partitioning: Only partition if p1 doesn't exist
-    if ! lsblk \$LOOP_DEV | grep -q \"\${LOOP_DEV##*/}p1\"; then
+    # Idempotent Partitioning
+    # Check if partition 1 exists on the loop device
+    if ! lsblk -n \$LOOP_DEV | grep -q \"p1\"; then
         echo 'Partitioning (2GB Boot, Remainder Root)...'
-        # o: clear, n: new, p: primary, 1: part num, default start, +2G: size, t: type, c: W95 FAT32 (LBA)
         printf 'o\nn\np\n1\n\n+2G\nt\nc\nn\np\n2\n\n\nw\n' | fdisk \$LOOP_DEV
+        echo 'Forcing kernel to reload partition table...'
+        partprobe \$LOOP_DEV
         sync
+        sleep 2 # Give /dev/ entries a moment to populate
     else
-        echo 'Partitions already exist. Skipping.'
+        echo 'Partitions already exist.'
+    fi
+
+    # Final validation that device nodes exist before formatting
+    if [ ! -b \"\${LOOP_DEV}p1\" ]; then
+        echo 'ERROR: \${LOOP_DEV}p1 not found. Attempting manual mknod...'
+        # Fallback for some Docker environments
+        PART_NAME=\$(basename \$LOOP_DEV)
+        MAJ=\$(cat /sys/block/\$PART_NAME/dev | cut -d: -f1)
+        MIN_BOOT=\$(cat /sys/block/\$PART_NAME/\${PART_NAME}p1/dev | cut -d: -f2)
+        MIN_ROOT=\$(cat /sys/block/\$PART_NAME/\${PART_NAME}p2/dev | cut -d: -f2)
+        mknod \${LOOP_DEV}p1 b \$MAJ \$MIN_BOOT
+        mknod \${LOOP_DEV}p2 b \$MAJ \$MIN_ROOT
     fi
 
     echo 'Formatting partitions...'
@@ -74,10 +97,9 @@ docker run --rm --privileged \
     mkdir -p /mnt/root/boot
     mount \${LOOP_DEV}p1 /mnt/root/boot
     
-    # Use bsdtar (package libarchive-tools) to extract
     bsdtar -xpf $ARCH_TARBALL -C /mnt/root
     
-    echo 'Finalizing and Syncing...'
+    echo 'Finalizing...'
     sync
     umount -R /mnt/root
     losetup -d \$LOOP_DEV
@@ -86,5 +108,4 @@ docker run --rm --privileged \
 
 echo "-------------------------------------------"
 echo "--- SUCCESS: Your base image is ready ---"
-echo "Location: $IMG_FILE"
 echo "-------------------------------------------"
