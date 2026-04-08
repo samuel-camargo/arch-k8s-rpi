@@ -8,7 +8,6 @@ WORKSPACE="$HOME/rpi_arch_build"
 BASE_IMG="rpi_arch_base.img"
 RPI5_IMG="rpi5_master.img"
 
-# Mirror paths based on your previous check
 MIRROR_CORE="http://fl.us.mirror.archlinuxarm.org/aarch64/core"
 MIRROR_ALARM="http://fl.us.mirror.archlinuxarm.org/aarch64/alarm"
 
@@ -42,8 +41,8 @@ docker run --rm --privileged \
     set -e
     export DEBIAN_FRONTEND=noninteractive
     
-    echo 'Installing system dependencies...'
-    apt-get update -qq && apt-get install -y -qq kpartx wget zstd fdisk dosfstools e2fsprogs curl > /dev/null
+    echo 'Installing system dependencies (Added xz-utils)...'
+    apt-get update -qq && apt-get install -y -qq kpartx wget zstd xz-utils fdisk dosfstools e2fsprogs curl > /dev/null
 
     cd /work
     
@@ -51,9 +50,8 @@ docker run --rm --privileged \
     CORE_LIST=\$(curl -sL $MIRROR_CORE/)
     ALARM_LIST=\$(curl -sL $MIRROR_ALARM/)
     
-    # Discovery logic adjusted for your mirror's naming conventions
-    # Matches: linux-rpi, raspberrypi-bootloader, firmware-raspberrypi
-    KERNEL_PKG=\$(echo \"\$CORE_LIST\" | grep -oE 'linux-rpi-[^[:space:]\"]+\.pkg\.tar\.xz' | sort -V | tail -n 1)
+    # Discovery logic: Added 'grep -v headers' to ensure we get the KERNEL, not the HEADERS
+    KERNEL_PKG=\$(echo \"\$CORE_LIST\" | grep -oE 'linux-rpi-[0-9][^[:space:]\"]+\.pkg\.tar\.xz' | grep -v 'headers' | sort -V | tail -n 1)
     BOOT_PKG=\$(echo \"\$ALARM_LIST\" | grep -oE 'raspberrypi-bootloader-[^[:space:]\"]+\.pkg\.tar\.xz' | sort -V | tail -n 1)
     FIRM_PKG=\$(echo \"\$ALARM_LIST\" | grep -oE 'firmware-raspberrypi-[^[:space:]\"]+\.pkg\.tar\.xz' | sort -V | tail -n 1)
 
@@ -105,7 +103,6 @@ docker run --rm --privileged \
 /dev/mmcblk0p2  /       ext4    defaults,noatime  0       1
 EOF
 
-    # Kernel cmdline for RPi 5
     echo 'root=/dev/mmcblk0p2 rw rootwait console=serial0,115200 console=tty1 selinux=0 smsc95xx.turbo_mode=N' > /mnt/root/boot/cmdline.txt
 
     sync
