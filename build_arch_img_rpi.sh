@@ -8,7 +8,7 @@ WORKSPACE="$HOME/rpi_arch_build"
 BASE_IMG="rpi_arch_base.img"
 RPI5_IMG="rpi5_master.img"
 
-# We will check both of these locations
+# Mirror paths based on your previous check
 MIRROR_CORE="http://fl.us.mirror.archlinuxarm.org/aarch64/core"
 MIRROR_ALARM="http://fl.us.mirror.archlinuxarm.org/aarch64/alarm"
 
@@ -32,9 +32,9 @@ if [ ! -f "$BASE_IMG" ]; then
 fi
 
 cp "$BASE_IMG" "$RPI5_IMG"
-log "Cloned $BASE_IMG to $RPI5_IMG."
+log "Cloned base image."
 
-log "Step 2: Launching Docker for Offline Injection"
+log "Step 2: Launching Docker for Injection"
 docker run --rm --privileged \
     --dns 8.8.8.8 \
     -v "$WORKSPACE":/work \
@@ -47,47 +47,29 @@ docker run --rm --privileged \
 
     cd /work
     
-    echo 'Fetching mirror indexes (Core & Alarm)...'
+    echo 'Fetching mirror indexes...'
     CORE_LIST=\$(curl -sL $MIRROR_CORE/)
     ALARM_LIST=\$(curl -sL $MIRROR_ALARM/)
-    FULL_LIST=\"\$CORE_LIST \$ALARM_LIST\"
     
-    # Discovery function that returns the full URL
-    FIND_URL() {
-        PKG_NAME=\$(echo \"\$FULL_LIST\" | grep -oE \"\$1-[0-9][^[:space:]\\\">]+\.pkg\.tar\.(zst|xz)\" | sort -V | tail -n 1)
-        if echo \"\$CORE_LIST\" | grep -q \"\$PKG_NAME\"; then
-            echo \"$MIRROR_CORE/\$PKG_NAME\"
-        else
-            echo \"$MIRROR_ALARM/\$PKG_NAME\"
-        fi
-    }
-
-    KERNEL_URL=\$(FIND_URL \"linux-rpi\")
-    BOOT_URL=\$(FIND_URL \"raspberrypi-bootloader\")
-    FIRM_URL=\$(FIND_URL \"raspberrypi-firmware\")
-
-    # Extract filenames for the extraction loop
-    KERNEL_PKG=\$(basename \$KERNEL_URL)
-    BOOT_PKG=\$(basename \$BOOT_URL)
-    FIRM_PKG=\$(basename \$FIRM_URL)
+    # Discovery logic adjusted for your mirror's naming conventions
+    # Matches: linux-rpi, raspberrypi-bootloader, firmware-raspberrypi
+    KERNEL_PKG=\$(echo \"\$CORE_LIST\" | grep -oE 'linux-rpi-[^[:space:]\"]+\.pkg\.tar\.xz' | sort -V | tail -n 1)
+    BOOT_PKG=\$(echo \"\$ALARM_LIST\" | grep -oE 'raspberrypi-bootloader-[^[:space:]\"]+\.pkg\.tar\.xz' | sort -V | tail -n 1)
+    FIRM_PKG=\$(echo \"\$ALARM_LIST\" | grep -oE 'firmware-raspberrypi-[^[:space:]\"]+\.pkg\.tar\.xz' | sort -V | tail -n 1)
 
     echo \"Found Kernel: \$KERNEL_PKG\"
     echo \"Found Bootloader: \$BOOT_PKG\"
     echo \"Found Firmware: \$FIRM_PKG\"
 
-    if [[ \"\$KERNEL_PKG\" == \"/\" || \"\$BOOT_PKG\" == \"/\" ]]; then
-        echo 'ERROR: Discovery failed. Check mirror paths.'
+    if [ -z \"\$KERNEL_PKG\" ] || [ -z \"\$BOOT_PKG\" ] || [ -z \"\$FIRM_PKG\" ]; then
+        echo 'ERROR: Discovery failed. One of the packages was not found.'
         exit 1
     fi
 
-    URLS=(\"\$KERNEL_URL\" \"\$BOOT_URL\" \"\$FIRM_URL\")
-    for url in \"\${URLS[@]}\"; do
-        pkg=\$(basename \$url)
-        if [ ! -f \"\$pkg\" ]; then
-            echo \"Downloading \$pkg...\"
-            wget --show-progress -q \"\$url\"
-        fi
-    done
+    # Download from appropriate source
+    [ ! -f \"\$KERNEL_PKG\" ] && wget -q --show-progress \"$MIRROR_CORE/\$KERNEL_PKG\"
+    [ ! -f \"\$BOOT_PKG\" ] && wget -q --show-progress \"$MIRROR_ALARM/\$BOOT_PKG\"
+    [ ! -f \"\$FIRM_PKG\" ] && wget -q --show-progress \"$MIRROR_ALARM/\$FIRM_PKG\"
 
     echo 'Mapping image partitions...'
     kpartx -d $RPI5_IMG || true
@@ -107,7 +89,7 @@ docker run --rm --privileged \
         tar -xpf \"\$pkg\" -C /mnt/root --exclude='.PKGINFO' --exclude='.MTREE' --exclude='.INSTALL'
     done
 
-    echo 'Configuring Headless Access...'
+    echo 'Enabling Headless Access (SSH/Root)...'
     ln -sf /usr/lib/systemd/system/sshd.service /mnt/root/etc/systemd/system/multi-user.target.wants/sshd.service
     sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /mnt/root/etc/ssh/sshd_config
     
@@ -123,6 +105,7 @@ docker run --rm --privileged \
 /dev/mmcblk0p2  /       ext4    defaults,noatime  0       1
 EOF
 
+    # Kernel cmdline for RPi 5
     echo 'root=/dev/mmcblk0p2 rw rootwait console=serial0,115200 console=tty1 selinux=0 smsc95xx.turbo_mode=N' > /mnt/root/boot/cmdline.txt
 
     sync
