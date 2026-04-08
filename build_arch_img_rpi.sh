@@ -28,12 +28,12 @@ log_step()   { echo -e "${B_CYAN}[🚀 STEP]${NC} $1"; }
 mkdir -p "$WORKSPACE"
 cd "$WORKSPACE"
 
-log_header "RPI 4 WORKER: $HOSTNAME CONFIG"
+log_header "RPI 4 WORKER: $HOSTNAME (4K KERNEL FIX)"
 
-log_step "Creating 6GB optimized build image..."
-truncate -s 6G "$WORKER_IMG"
+log_step "Creating 7GB build image..."
+truncate -s 7G "$WORKER_IMG"
 
-log_step "Launching Docker context..."
+log_step "Launching Docker Context..."
 
 docker run --rm --privileged \
     --dns 8.8.8.8 \
@@ -102,7 +102,7 @@ EOF
     rsync -aAX /mnt/base_root/ /mnt/new_root/
     succ
 
-    task 'Injecting Auto-Expand & K8s Prep'
+    task 'Injecting Auto-Expand & Power-Save Kill'
     cat <<'EOF_SH' > /mnt/new_root/usr/local/bin/rpi-expand-root.sh
 #!/bin/bash
 iw dev wlan0 set power_save off || true
@@ -128,7 +128,9 @@ ExecStart=/usr/local/bin/rpi-expand-root.sh
 WantedBy=multi-user.target
 EOF
     ln -sf /etc/systemd/system/rpi-expand-root.service /mnt/new_root/etc/systemd/system/multi-user.target.wants/rpi-expand-root.service
-    
+    succ
+
+    task 'Configuring Network'
     echo \"\$HOSTNAME\" > /mnt/new_root/etc/hostname
     cat <<EOF > /mnt/new_root/etc/systemd/network/25-wireless.network
 [Match]
@@ -139,17 +141,17 @@ Gateway=\$GATEWAY
 DNS=1.1.1.1
 IPv6AcceptRA=no
 EOF
-    # K8s sysctl
     mkdir -p /mnt/new_root/etc/modules-load.d /mnt/new_root/etc/sysctl.d
     echo -e \"overlay\nbr_netfilter\" > /mnt/new_root/etc/modules-load.d/k8s.conf
     echo -e \"net.bridge.bridge-nf-call-iptables=1\nnet.bridge.bridge-nf-call-ip6tables=1\nnet.ipv4.ip_forward=1\" > /mnt/new_root/etc/sysctl.d/k8s.conf
     succ
 
-    task 'Patching Drivers (RPi 4 Specific)'
-    # Note: RPi 4 uses the same linux-rpi package but needs different .dtb files
+    task 'Injecting RPi 4 Standard (4k) Kernel'
     K_RAW=\$(curl -sL http://fl.us.mirror.archlinuxarm.org/aarch64/core/)
     F_RAW=\$(curl -sL http://fl.us.mirror.archlinuxarm.org/aarch64/alarm/)
-    KERNEL_PKG=\$(echo \"\$K_RAW\" | grep -oE 'linux-rpi-[0-9][^[:space:]\"]+\.pkg\.tar\.xz' | head -n 1)
+    
+    # FIX: Explicitly ignore '16k' and 'headers' to get the standard RPi 4 kernel
+    KERNEL_PKG=\$(echo \"\$K_RAW\" | grep -oE 'linux-rpi-[0-9][^[:space:]\"]+\.pkg\.tar\.xz' | grep -v '16k' | grep -v 'headers' | head -n 1)
     FIRM_RPI=\$(echo \"\$F_RAW\" | grep -oE 'firmware-raspberrypi-[^[:space:]\"]+\.pkg\.tar\.xz' | head -n 1)
     BOOT_PKG=\$(echo \"\$F_RAW\" | grep -oE 'raspberrypi-bootloader-[^[:space:]\"]+\.pkg\.tar\.xz' | head -n 1)
     REGDB_PKG=\$(echo \"\$K_RAW\" | grep -oE 'wireless-regdb-[^[:space:]\"]+\.pkg\.tar\.xz' | head -n 1)
@@ -166,7 +168,7 @@ EOF
     [ -d /mnt/new_root/boot/boot ] && mv /mnt/new_root/boot/boot/* /mnt/new_root/boot/ && rmdir /mnt/new_root/boot/boot
     depmod -b /mnt/new_root \$(ls /mnt/new_root/usr/lib/modules | head -n 1)
     
-    # WiFi Hardening
+    # WiFi Driver Hardening
     mkdir -p /mnt/new_root/etc/modprobe.d
     echo \"options brcmfmac roamoff=1 feature_disable=0x82000 ccode=\$REG_DOMAIN\" > /mnt/new_root/etc/modprobe.d/brcmfmac.conf
     printf \"country=\$REG_DOMAIN\nctrl_interface=/var/run/wpa_supplicant\nupdate_config=1\n\nnetwork={\n    ssid=\\\"\$WIFI_SSID\\\"\n    psk=\\\"\$WIFI_PASS\\\"\n    key_mgmt=WPA-PSK\n    ieee80211w=1\n}\n\" > /mnt/new_root/etc/wpa_supplicant/wpa_supplicant-wlan0.conf
@@ -176,12 +178,12 @@ EOF
     
     sed -i 's/^root:[^:]*:/root::/' /mnt/new_root/etc/shadow
     
-    # BOOT CONFIG: Pi 4 DTB and 64-bit enable
+    # BOOT CONFIG: Explicitly Pi 4
     echo -e \"arm_64bit=1\nkernel=Image\ndevice_tree=bcm2711-rpi-4-b.dtb\nusb_max_current_enable=1\" > /mnt/new_root/boot/config.txt
     echo \"root=/dev/mmcblk0p2 rw rootwait console=tty1 selinux=0 net.ifnames=0 ipv6.disable=1 cgroup_enable=cpuset cgroup_enable=memory cgroup_memory=1 cfg80211.regdom=\$REG_DOMAIN\" > /mnt/new_root/boot/cmdline.txt
     succ
 
-    task 'Syncing'
+    task 'Finalizing'
     sync
     umount -R /mnt/base_root /mnt/new_root > /dev/null 2>&1
     kpartx -d \"\$LOOP_BASE\" > /dev/null 2>&1 && kpartx -d \"\$LOOP_NEW\" > /dev/null 2>&1
@@ -189,7 +191,7 @@ EOF
     succ
 "
 
-log_header "SUCCESS: READY TO FLASH"
+log_header "SUCCESS: READY TO FLASH RPI 4"
 echo -e "Hostname: ${B_GREEN}$HOSTNAME${NC}"
 echo -e "IPv4:     ${B_GREEN}$STATIC_IP${NC}"
 echo -e "Flash:    ${B_CYAN}sudo dd if=$WORKER_IMG of=/dev/diskX bs=4M status=progress${NC}"
