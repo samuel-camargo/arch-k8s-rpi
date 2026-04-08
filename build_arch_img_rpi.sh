@@ -31,7 +31,6 @@ START_TIME=$SECONDS
 
 log_header() { echo -e "\n${B_MAGENTA}🚀 [$(date +%T)] ==================== $1 ====================${NC}"; }
 log_step()   { echo -e "${B_CYAN}[⭐]${NC} $1"; }
-log_info()   { echo -e "     ${B_YELLOW}i${NC} $1"; }
 log_success(){ echo -e "     ${B_GREEN}✔${NC} $1"; }
 log_error()  { echo -e "${B_RED}[💥 ERROR]${NC} $1\nCheck $LOG_FILE for details."; exit 1; }
 
@@ -39,13 +38,10 @@ mkdir -p "$WORKSPACE"
 echo "--- Build Log Started $(date) ---" > "$LOG_FILE"
 cd "$WORKSPACE"
 
-# =========================================================
 # PHASE 1: BASE IMAGE GENERATION
-# =========================================================
 if [ ! -f "$BASE_IMG" ]; then
     log_header "PHASE 1: BASE ARCHITECTURE"
     [ ! -f "$ARCH_TARBALL" ] && wget -c -O "$ARCH_TARBALL" "http://os.archlinuxarm.org/os/$ARCH_TARBALL" >> "$LOG_FILE" 2>&1
-    
     truncate -s 10G "$BASE_IMG"
     docker run --rm --privileged -v "$WORKSPACE":/work ubuntu:22.04 bash -c "
         export DEBIAN_FRONTEND=noninteractive
@@ -66,9 +62,7 @@ if [ ! -f "$BASE_IMG" ]; then
     " || log_error "Base build failed."
 fi
 
-# =========================================================
 # PHASE 2: CUSTOMIZATION
-# =========================================================
 log_header "PHASE 2: KUBE-NODE HARDENING"
 cp "$BASE_IMG" "$TARGET_IMG"
 
@@ -80,7 +74,6 @@ docker run --rm --privileged \
     ubuntu:22.04 bash -c "
     set -e
     export DEBIAN_FRONTEND=noninteractive
-    
     task() { echo -ne \"\033[1;36m  [⏳]\033[0m \$1... \"; }
     done_task() { echo -e \"\033[1;32mDONE\033[0m\"; }
 
@@ -102,24 +95,30 @@ docker run --rm --privileged \
     rm -rf /mnt/target/boot/*
     done_task
 
-    task 'Injecting Robust Provisioning'
+    task 'Enabling Root SSH & MOTD'
+    # Allow root login and set password to 'root'
+    sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/' /mnt/target/etc/ssh/sshd_config
+    sed -i 's/^#PrintMotd.*/PrintMotd yes/' /mnt/target/etc/ssh/sshd_config
+    echo 'root:root' | chroot /mnt/target chpasswd
+    done_task
+
+    task 'Injecting Ultimate Provisioning (v23)'
     cat <<'EOF_PROV' > /mnt/target/usr/local/bin/rpi-provision.sh
 #!/bin/bash
-# Fail immediately if any command fails
 set -e
 
 LOG=\"/var/log/provision.log\"
 touch \$LOG
+chmod 644 \$LOG # Allow 'alarm' user to read progress
 exec > >(tee -a \"\$LOG\") 2>&1
 
 log_prov() {
     local MSG=\"[\$(date +%T)] \$1\"
     echo -e \"\033[1;32m\$MSG\033[0m\" > /dev/console
     echo \"\$MSG\"
-    echo -e \"Arch Linux RPi Node: $HOSTNAME\nStatus: \$1\" > /etc/motd
+    echo -e \"\n#################################################\n  NODE: $HOSTNAME\n  STATUS: \$1\n#################################################\n\" > /etc/motd
 }
 
-# Helper for flaky mirrors: tries 5 times with forced refresh
 pacman_retry() {
     local n=1; local max=5; local delay=10
     while true; do
@@ -129,10 +128,9 @@ pacman_retry() {
                 ((n++))
                 log_prov \"⚠️ Mirror Timeout. Retrying (\$n/\$max) in \$delay seconds...\"
                 sleep \$delay
-                pacman -Syy # Force database refresh on failure
+                pacman -Syy
             else
-                log_prov \"❌ FATAL ERROR: Mirror failure after \$max attempts.\"
-                echo -e \"Arch Linux RPi Node: $HOSTNAME\nStatus: FAILED AT STEP: \$*\" > /etc/motd
+                log_prov \"❌ FATAL ERROR: Mirror failure.\"
                 exit 1
             fi
         fi
@@ -155,7 +153,7 @@ pacman_retry pacman -Syu --noconfirm
 timedatectl set-ntp true
 swapoff -a && sed -i '/swap/d' /etc/fstab
 
-log_prov \"⚙️ (Step 4/7) Loading K8s Modules...\"
+log_prov \"⚙️ (Step 4/7) Configuring Kernel Modules...\"
 mkdir -p /etc/modules-load.d && echo -e \"overlay\nbr_netfilter\" > /etc/modules-load.d/k8s.conf
 modprobe overlay || true && modprobe br_netfilter || true
 cat <<EOF_SYS > /etc/sysctl.d/k8s.conf
@@ -171,19 +169,13 @@ mkdir -p /etc/containerd && containerd config default > /etc/containerd/config.t
 sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
 systemctl enable --now containerd kubelet
 
-# Verification
-if ! command -v containerd &> /dev/null; then
-    log_prov \"❌ FATAL: Containerd installation failed verification.\"
-    exit 1
-fi
-
-log_prov \"💾 (Step 6/7) Finalizing Disk...\"
+log_prov \"💾 (Step 6/7) Expanding Filesystem...\"
 ROOT_DEV=\$(findmnt / -o SOURCE -n)
 echo -e \"d\n2\nn\np\n2\n\n\ny\nw\" | fdisk \${ROOT_DEV%p*} > /dev/null 2>&1
 partx -u \${ROOT_DEV%p*} || true && resize2fs \$ROOT_DEV > /dev/null 2>&1
 
 log_prov \"✅ (Step 7/7) COMPLETE! Node is Ready.\"
-echo -e \"Arch Linux RPi Node: $HOSTNAME\nStatus: PROVISIONED / READY\" > /etc/motd
+echo -e \"\nStatus: PROVISIONED / READY\n\" > /etc/motd
 systemctl disable rpi-provision.service && rm /etc/systemd/system/rpi-provision.service
 EOF_PROV
     chmod +x /mnt/target/usr/local/bin/rpi-provision.sh
@@ -211,7 +203,7 @@ EOF
         K_PKG=\$(curl -sL \$K_MIRROR/core/ | grep -oE 'linux-rpi-[0-9][^[:space:]\"]+\.pkg\.tar\.xz' | grep -v '16k' | grep -v 'headers' | sort -V | tail -n 1)
         DTB=\"bcm2711-rpi-4-b.dtb\"
     else
-        K_PKG=\$(curl -sL \$K_MIRROR/core/ | grep -oE 'linux-rpi-[0-9][^[:space:]\"]+\.pkg\.tar\.xz' | grep -v 'headers' | sort -V | tail -n 1)
+        K_PKG=\$(curl -sL \$K_MIRROR/core/ | grep -oE 'linux-rpi-[0-9][^[:space:]\"]+\.pkg\.tar\.xz' | grep -v '16k' | grep -v 'headers' | sort -V | tail -n 1)
         DTB=\"bcm2712-rpi-5-b.dtb\"
     fi
     REG=\$(curl -sL \$K_MIRROR/core/ | grep -oE 'wireless-regdb-[^[:space:]\"]+\.pkg\.tar\.xz' | head -n 1)
