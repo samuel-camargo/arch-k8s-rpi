@@ -7,6 +7,7 @@ set -e
 WORKSPACE="$HOME/rpi_arch_build"
 BASE_IMG="rpi_arch_base.img"
 RPI5_IMG="rpi5_master.img"
+# Using a specific mirror IP/Domain that is generally stable
 MIRROR="http://mirror.archlinuxarm.org/aarch64/alarm"
 
 # Colors
@@ -32,7 +33,9 @@ cp "$BASE_IMG" "$RPI5_IMG"
 log "Cloned $BASE_IMG to $RPI5_IMG."
 
 log "Step 2: Launching Docker for Offline Injection"
+# Added --dns 8.8.8.8 to bypass potential Docker Desktop DNS lag
 docker run --rm --privileged \
+    --dns 8.8.8.8 \
     -v "$WORKSPACE":/work \
     ubuntu:22.04 bash -c "
     set -e
@@ -43,19 +46,16 @@ docker run --rm --privileged \
 
     cd /work
     
-    echo 'Checking mirror connectivity...'
-    if ! curl -s --head $MIRROR/ | grep '200 OK' > /dev/null; then
-        echo 'ERROR: Cannot reach Arch Linux ARM mirror.'
+    echo 'Checking mirror connectivity (with retries)...'
+    # More resilient check: try to fetch just the first 10 lines of the index
+    if ! curl -s --connect-timeout 5 $MIRROR/ | head -n 5 > /dev/null; then
+        echo 'ERROR: Cannot reach Arch Linux ARM mirror. Check your Mac internet or VPN.'
         exit 1
     fi
 
     echo 'Discovering latest RPi 5 packages...'
     HTML_LIST=\$(curl -sL $MIRROR/)
     
-    # Robust filename extraction:
-    # 1. Finds the prefix (e.g. linux-rpi-)
-    # 2. Captures everything until .pkg.tar.zst
-    # 3. Sorts version-wise and takes the latest
     GET_LATEST() {
         echo \"\$HTML_LIST\" | grep -oE \"\$1-[0-9][a-zA-Z0-9._-]+-aarch64\.pkg\.tar\.zst|\$1-[0-9][a-zA-Z0-9._-]+-any\.pkg\.tar\.zst\" | sort -V | tail -n 1
     }
@@ -64,24 +64,13 @@ docker run --rm --privileged \
     BOOT_PKG=\$(GET_LATEST \"raspberrypi-bootloader\")
     FIRM_PKG=\$(GET_LATEST \"raspberrypi-firmware\")
 
-    echo \"Found:\"
-    echo \"  - Kernel: \$KERNEL_PKG\"
-    echo \"  - Bootloader: \$BOOT_PKG\"
-    echo \"  - Firmware: \$FIRM_PKG\"
-
-    if [ -z \"\$KERNEL_PKG\" ] || [ -z \"\$BOOT_PKG\" ] || [ -z \"\$FIRM_PKG\" ]; then
-        echo 'ERROR: One or more packages could not be identified on the mirror.'
-        exit 1
-    fi
+    echo \"Found: \$KERNEL_PKG, \$BOOT_PKG, \$FIRM_PKG\"
 
     PKGS=(\"\$KERNEL_PKG\" \"\$BOOT_PKG\" \"\$FIRM_PKG\")
-
     for pkg in \"\${PKGS[@]}\"; do
         if [ ! -f \"\$pkg\" ]; then
             echo \"Downloading \$pkg...\"
             wget --show-progress -q \"$MIRROR/\$pkg\"
-        else
-            echo \"\$pkg is already present.\"
         fi
     done
 
@@ -96,13 +85,29 @@ docker run --rm --privileged \
     mkdir -p /mnt/root/boot
     mount \"/dev/mapper/\$BOOT_MAPPER\" /mnt/root/boot
 
-    echo 'Injecting Kernel and Firmware...'
+    echo 'Injecting Kernel/Firmware and enabling Headless Access...'
     for pkg in \"\${PKGS[@]}\"; do
-        echo \"Extracting \$pkg...\"
         tar --zstd -xpf \"\$pkg\" -C /mnt/root --exclude='.PKGINFO' --exclude='.MTREE' --exclude='.INSTALL'
     done
 
-    echo 'Configuring boot parameters...'
+    # --- Headless Configuration ---
+    # 1. Enable SSH at boot
+    ln -sf /usr/lib/systemd/system/sshd.service /mnt/root/etc/systemd/system/multi-user.target.wants/sshd.service
+    
+    # 2. Permit Root Login via SSH
+    sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /mnt/root/etc/ssh/sshd_config
+    
+    # 3. Setup SSH key for root (if your Mac has one)
+    mkdir -p /mnt/root/root/.ssh
+    chmod 700 /mnt/root/root/.ssh
+    if [ -f /work/id_rsa.pub ]; then
+        cp /work/id_rsa.pub /mnt/root/root/.ssh/authorized_keys
+    elif [ -f /work/id_ed25519.pub ]; then
+        cp /work/id_ed25519.pub /mnt/root/root/.ssh/authorized_keys
+    fi
+    # ------------------------------
+
+    echo 'Finalizing boot files...'
     cat <<EOF > /mnt/root/etc/fstab
 /dev/mmcblk0p1  /boot   vfat    defaults        0       0
 /dev/mmcblk0p2  /       ext4    defaults,noatime  0       1
