@@ -1,10 +1,11 @@
 #!/bin/bash
+# Stop script on any error
 set -e
 
-# --- CONFIGURATION ---
-HOSTNAME="kube-master-01"         
-PI_VERSION="5"                    
-STATIC_IP="192.168.1.150/24"      
+# --- CONFIGURATION (UPDATE THESE FOR EACH NODE) ---
+HOSTNAME="kube-worker-04"         # Update per node
+PI_VERSION="3"                    # Supports "3", "4", or "5"
+STATIC_IP="192.168.1.163/24"      
 GATEWAY="192.168.1.1"
 WIFI_SSID="YOUR_WIFI_NAME"
 WIFI_PASS="YOUR_WIFI_PASSWORD"
@@ -36,7 +37,9 @@ mkdir -p "$WORKSPACE"
 echo "--- Build Log Started $(date) ---" > "$LOG_FILE"
 cd "$WORKSPACE"
 
+# =========================================================
 # PHASE 1: BASE IMAGE VERIFICATION
+# =========================================================
 log_header "PHASE 1: BASE ARCHITECTURE"
 
 if [ ! -f "$ARCH_TARBALL" ]; then
@@ -71,8 +74,10 @@ else
     log_success "Existing base image found ($BASE_IMG). Reusing."
 fi
 
+# =========================================================
 # PHASE 2: CUSTOMIZATION
-log_header "PHASE 2: KUBE-NODE HARDENING"
+# =========================================================
+log_header "PHASE 2: KUBE-NODE HARDENING (RPi $PI_VERSION)"
 log_step "Cloning base image to $TARGET_IMG..."
 cp "$BASE_IMG" "$TARGET_IMG"
 
@@ -87,7 +92,6 @@ docker run --rm --privileged \
     task() { echo -ne \"\033[1;36m  [⏳]\033[0m \$1... \"; }
     done_task() { echo -e \"\033[1;32mDONE\033[0m\"; }
 
-    # Silencing the apt installation to keep build.log clean
     apt-get update -qq && apt-get install -y -qq kpartx curl xz-utils fdisk wget kmod rsync dosfstools e2fsprogs parted > /dev/null 2>&1
     
     cd /work
@@ -113,7 +117,7 @@ timeout: 10
 EOF_CRI
     done_task
 
-    task 'Injecting Ironclad Provisioning (v29)'
+    task 'Injecting Universal Provisioning (v30)'
     cat <<'EOF_PROV' > /mnt/target/usr/local/bin/rpi-provision.sh
 #!/bin/bash
 set -e
@@ -123,7 +127,6 @@ exec > >(tee -a \"\$LOG\") 2>&1
 
 log_prov() {
     local MSG=\"[\$(date +%T)] \$1\"
-    # Direct to TTY1 for faster HDMI visibility
     echo -e \"\033[1;32m\$MSG\033[0m\" > /dev/tty1
     echo \"\$MSG\"
     echo -e \"\n NODE: $HOSTNAME\n STATUS: \$1\n\" > /etc/motd
@@ -201,8 +204,12 @@ EOF
     task 'Fetching Drivers'
     K_MIRROR=\"http://fl.us.mirror.archlinuxarm.org/aarch64\"
     K_PKG=\$(curl -sL \$K_MIRROR/core/ | grep -oE 'linux-rpi-[0-9][^[:space:]\"]+\.pkg\.tar\.xz' | grep -v '16k' | grep -v 'headers' | sort -V | tail -n 1)
+    
+    # --- Universal DTB Selection ---
     DTB=\"bcm2711-rpi-4-b.dtb\"
     [ \"\$PI_VERSION\" == \"5\" ] && DTB=\"bcm2712-rpi-5-b.dtb\"
+    [ \"\$PI_VERSION\" == \"3\" ] && DTB=\"bcm2710-rpi-3-b.dtb\"
+    
     BOOT=\$(curl -sL \$K_MIRROR/alarm/ | grep -oE 'raspberrypi-bootloader-[^[:space:]\"]+\.pkg\.tar\.xz' | tail -n 1)
     FIRM=\$(curl -sL \$K_MIRROR/alarm/ | grep -oE 'firmware-raspberrypi-[^[:space:]\"]+\.pkg\.tar\.xz' | tail -n 1)
     wget -q \"\$K_MIRROR/core/\$K_PKG\" \"\$K_MIRROR/alarm/\$BOOT\" \"\$K_MIRROR/alarm/\$FIRM\"
