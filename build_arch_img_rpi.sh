@@ -1,5 +1,5 @@
 #!/bin/bash
-# Kube-Arch Cluster Factory v47 - BASE64 EDITION
+# Kube-Arch Cluster Factory v50 - SAMUEL EDITION
 set -e
 
 # --- CONFIGURATION (Update per node) ---
@@ -10,7 +10,7 @@ GATEWAY="192.168.1.1"
 WIFI_SSID="YOUR_WIFI_NAME"
 WIFI_PASS="YOUR_WIFI_PASSWORD"
 REG_DOMAIN="PT"
-BUILD_VERSION="v47-Gold"
+BUILD_VERSION="v50-Gold"
 
 # --- SYSTEM PATHS ---
 WORKSPACE="$HOME/rpi_arch_build"
@@ -27,25 +27,13 @@ cd "$WORKSPACE"
 echo -e "\n${B_MAGENTA}🚀 PHASE 1: BASE ARCHITECTURE${NC}"
 [ -f "$ARCH_TARBALL" ] && [ -f "$BASE_IMG" ] || (echo "Missing base files!" && exit 1)
 
-echo -e "${B_MAGENTA}🚀 PHASE 2: CUSTOMIZATION (v47)${NC}"
+echo -e "${B_MAGENTA}🚀 PHASE 2: CUSTOMIZATION (v50)${NC}"
 cp "$BASE_IMG" "$TARGET_IMG"
-
-# Generate the Banner in Base64 to avoid escaping hell
-BANNER_B64=$(echo '#!/bin/bash
-COL_M="\033[1;35m"; COL_C="\033[1;36m"; NC="\033[0m"
-echo -e "${COL_M}=======================================================${NC}"
-echo -e "  🚀 ${COL_C}NODE:${NC} $(hostname)"
-echo -e "  ⭐ ${COL_C}OS:${NC}   $(grep PRETTY_NAME /etc/os-release | cut -d\"\\\"\" -f2)"
-echo -e "  🧠 ${COL_C}KERN:${NC} $(uname -r)"
-echo -e "  📦 ${COL_C}PKGS:${NC} $(pacman -Q | wc -l) installed"
-echo -e "  🌐 ${COL_C}IP:${NC}   $(hostname -I | awk "{print \$1}")"
-echo -e "  🛠️  ${COL_C}IMG:${NC}  '${BUILD_VERSION}'"
-echo -e "${COL_M}=======================================================${NC}"' | base64)
 
 docker run --rm --privileged --dns 8.8.8.8 -v "$WORKSPACE":/work \
     -e WIFI_SSID="$WIFI_SSID" -e WIFI_PASS="$WIFI_PASS" -e REG_DOMAIN="$REG_DOMAIN" \
     -e STATIC_IP="$STATIC_IP" -e GATEWAY="$GATEWAY" -e HOSTNAME="$HOSTNAME" \
-    -e BANNER_DATA="$BANNER_B64" -e TARGET_IMG="$TARGET_IMG" \
+    -e BUILD_VER="$BUILD_VERSION" -e TARGET_IMG="$TARGET_IMG" \
     -e PI_VER="$PI_VERSION" \
     ubuntu:22.04 bash -c "
     set -e
@@ -57,17 +45,38 @@ docker run --rm --privileged --dns 8.8.8.8 -v "$WORKSPACE":/work \
     mkdir -p /mnt/target && mount \"/dev/mapper/\${LNAME}p2\" /mnt/target
     mkdir -p /mnt/target/boot && mount \"/dev/mapper/\${LNAME}p1\" /mnt/target/boot
 
-    # --- DECODE THE BANNER ---
-    echo \"\$BANNER_DATA\" | base64 -d > /mnt/target/etc/profile.d/kube-banner.sh
+    # --- THE UNIVERSAL BANNER (v50) ---
+    # We use . /etc/os-release to get the OS name without using 'cut'
+    cat <<'EOF_BANNER' > /mnt/target/etc/profile.d/kube-banner.sh
+#!/bin/bash
+[ -f /etc/os-release ] && . /etc/os-release
+COL_M='\033[1;35m'; COL_C='\033[1;36m'; NC='\033[0m'
+
+# Get IP via ip route (works on all versions)
+MY_IP=$(ip addr show wlan0 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1)
+[ -z \"\$MY_IP\" ] && MY_IP=$(ip addr show eth0 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1)
+
+echo -e \"\${COL_M}=======================================================\${NC}\"
+echo -e \"  🚀 \${COL_C}NODE:\${NC} \$(cat /etc/hostname)\"
+echo -e \"  ⭐ \${COL_C}OS:\${NC}   \${PRETTY_NAME:-Arch Linux}\"
+echo -e \"  🧠 \${COL_C}KERN:\\033[0m \$(uname -r)\"
+echo -e \"  📦 \${COL_C}PKGS:\${NC} \$(pacman -Q | wc -l) installed\"
+echo -e \"  🌐 \${COL_C}IP:\${NC}   \${MY_IP:-No Connection}\"
+echo -e \"  🛠️  \${COL_C}IMG:\${NC}  \$(cat /etc/rpi-build-version 2>/dev/null)\"
+echo -e \"\${COL_M}=======================================================\${NC}\"
+EOF_BANNER
     chmod +x /mnt/target/etc/profile.d/kube-banner.sh
 
-    # Security & Quiet Console
+    # Record Build Info
+    echo \"\$BUILD_VER\" > /mnt/target/etc/rpi-build-version
+
+    # Security & Muzzle
     echo 'root:root' | chroot /mnt/target chpasswd
     sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/' /mnt/target/etc/ssh/sshd_config
     mkdir -p /mnt/target/etc/sysctl.d
     echo 'kernel.printk = 1 1 1 1' > /mnt/target/etc/sysctl.d/20-quiet.conf
 
-    # Provisioner Logic
+    # Provisioner (Restores inetutils just in case)
     cat <<'EOF_PROV' > /mnt/target/usr/local/bin/rpi-provision.sh
 #!/bin/bash
 set -e
@@ -76,7 +85,7 @@ exec > >(tee -a /var/log/provision.log) 2>&1
 for i in {1..20}; do ping -c 1 -W 1 8.8.8.8 &>/dev/null && break || sleep 2; done
 pacman-key --init && pacman-key --populate archlinuxarm
 pacman -Sy --noconfirm archlinux-keyring && pacman -Syu --noconfirm
-pacman -S --noconfirm containerd kubeadm kubelet kubectl runc open-iscsi nfs-utils
+pacman -S --noconfirm containerd kubeadm kubelet kubectl runc open-iscsi nfs-utils inetutils
 mkdir -p /etc/containerd && containerd config default > /etc/containerd/config.toml
 sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
 systemctl enable --now containerd kubelet iscsid
@@ -94,7 +103,7 @@ EOF_PROV
     chmod +x /mnt/target/usr/local/bin/rpi-provision.sh
     ln -sf /etc/systemd/system/rpi-provision.service /mnt/target/etc/systemd/system/multi-user.target.wants/rpi-provision.service
 
-    # Fetching correct Kernel for the Pi
+    # Fetching Drivers
     K_MIRROR=\"http://fl.us.mirror.archlinuxarm.org/aarch64\"
     K_PKG=\$(curl -sL \$K_MIRROR/core/ | grep -oE 'linux-rpi-[0-9][^[:space:]\"]+\.pkg\.tar\.xz' | head -n 1)
     REG=\$(curl -sL \$K_MIRROR/core/ | grep -oE 'wireless-regdb-[^[:space:]\"]+\.pkg\.tar\.xz' | head -n 1)
@@ -117,4 +126,4 @@ EOF_PROV
     sync && umount -R /mnt/target && kpartx -d \"\$LOOP_DEV\" && losetup -d \"\$LOOP_DEV\"
 "
 
-echo -e "\n${B_GREEN}✔ BUILD v47 COMPLETE!${NC}"
+echo -e "\n${B_GREEN}✔ BUILD v50 COMPLETE!${NC}"
