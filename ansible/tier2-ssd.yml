@@ -1,0 +1,42 @@
+---
+- name: Tier 2 - Distributed Block Storage (Longhorn) Provisioning
+  hosts: kube-worker-01, kube-worker-02, kube-worker-03
+  become: yes
+  tasks:
+    - name: Install parted utility
+      pacman:
+        name: parted
+        state: present
+
+    - name: Unmount /dev/sda1 if it is currently mounted
+      mount:
+        path: /mnt/longhorn-storage
+        state: unmounted
+      ignore_errors: yes
+
+    - name: Wipe disk signatures to prevent ghost partitions
+      shell: wipefs -af /dev/sda
+
+    - name: Create new GPT layout and partition
+      shell: parted -s /dev/sda mklabel gpt mkpart primary ext4 0% 100%
+
+    - name: Notify OS kernel of partition changes
+      shell: partprobe /dev/sda
+
+    - name: Format the new SSD partition to ext4
+      filesystem:
+        fstype: ext4
+        dev: /dev/sda1
+        force: yes
+
+    - name: Create the mount point directory for Longhorn
+      file:
+        path: /mnt/longhorn-storage
+        state: directory
+
+    - name: Mount the SSD and permanently add to /etc/fstab
+      mount:
+        path: /mnt/longhorn-storage
+        src: /dev/sda1
+        fstype: ext4
+        state: mounted

@@ -1,0 +1,40 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: prometheus-raw-backup
+  namespace: monitoring
+spec:
+  schedule: "0 3 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          nodeSelector:
+            kubernetes.io/hostname: kube-master-01
+          containers:
+          - name: backup-worker
+            # Use an image that ALREADY has rsync installed
+            image: instrumentisto/rsync-ssh:latest 
+            command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Ensuring destination directory exists..."
+              mkdir -p /destination-vault/prometheus-backup
+              echo "Starting backup of Raw NVMe data..."
+              # Use -rtv (recursive, times, verbose) for robust copying
+              rsync -rtv --delete /source-nvme/ /destination-vault/prometheus-backup/
+              echo "Backup Complete!"
+            volumeMounts:
+            - name: nvme-data
+              mountPath: /source-nvme
+            - name: hdd-vault
+              mountPath: /destination-vault
+          restartPolicy: OnFailure
+          volumes:
+          - name: nvme-data
+            hostPath:
+              path: /var/lib/kubernetes-data
+          - name: hdd-vault
+            hostPath:
+              path: /mnt/backup-vault

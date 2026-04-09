@@ -1,0 +1,35 @@
+---
+- name: Tier 1 - Fast Local NVMe Provisioning
+  hosts: kube-master-01
+  become: yes
+  tasks:
+    - name: Install parted utility
+      pacman:
+        name: parted
+        state: present
+
+    - name: Wipe existing partitions and create new GPT layout
+      parted:
+        device: /dev/nvme0n1
+        label: gpt
+        number: 1
+        state: present
+        part_end: "100%"
+
+    - name: Format the new NVMe partition to ext4
+      filesystem:
+        fstype: ext4
+        dev: /dev/nvme0n1p1
+        force: yes
+
+    - name: Create the mount point directory
+      file:
+        path: /mnt/fast-storage
+        state: directory
+
+    - name: Mount the NVMe drive and permanently add to /etc/fstab
+      mount:
+        path: /mnt/fast-storage
+        src: /dev/nvme0n1p1
+        fstype: ext4
+        state: mounted
