@@ -1,0 +1,17 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: longhorn-system
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: 'https://github.com/samuel-camargo/arch-k8s-rpi.git'
+    targetRevision: HEAD
+    path: apps/longhorn
+  destination:
+    server: 'https://kubernetes.default.svc'
+    namespace: longhorn-system
+  syncPolicy:
+    automated:
+      createNamespace: true

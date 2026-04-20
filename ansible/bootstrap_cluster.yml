@@ -1,0 +1,90 @@
+---
+- name: "Bootstrap Full DevSecOps Environment"
+  hosts: all
+  become: yes
+  vars:
+    nodes:
+      kube-master-01: 150
+      kube-master-02: 151
+      kube-worker-01: 160
+      kube-worker-02: 161
+      kube-worker-03: 162
+
+  tasks:
+    # --- OS & NETWORK FIXES ---
+    - name: "Configure Static LAN & WiFi"
+      block:
+        - name: "Set LAN (10.0.0.x) - No Gateway"
+          copy:
+            dest: /etc/systemd/network/20-lan.network
+            content: |
+              [Match]
+              Name=e*
+              [Network]
+              Address=10.0.0.{{ nodes[inventory_hostname] }}/24
+              DNS=8.8.8.8
+
+        - name: "Set WiFi (192.168.1.x) - Internet Gateway"
+          copy:
+            dest: /etc/systemd/network/25-wifi.network
+            content: |
+              [Match]
+              Name=w*
+              [Network]
+              Address=192.168.1.{{ nodes[inventory_hostname] }}/24
+              Gateway=192.168.1.1
+              DNS=8.8.8.8
+
+    - name: "Apply Kernel Parameters & Firewall"
+      block:
+        - name: "Sysctl Tweaks"
+          sysctl:
+            name: "{{ item.key }}"
+            value: "{{ item.value }}"
+            sysctl_file: /etc/sysctl.d/99-k8s.conf
+          loop:
+            - { key: 'net.ipv4.ip_forward', value: '1' }
+            - { key: 'net.ipv4.conf.all.rp_filter', value: '0' }
+            - { key: 'net.bridge.bridge-nf-call-iptables', value: '1' }
+
+        - name: "Ensure Masquerade on WiFi"
+          ansible.builtin.iptables:
+            table: nat
+            chain: POSTROUTING
+            out_interface: wld0
+            jump: MASQUERADE
+            action: insert
+            rule_num: 1
+
+    # --- ARGOCD BOOTSTRAP (Master-01 Only) ---
+    - name: "Setup GitOps Engine"
+      when: inventory_hostname == 'kube-master-01'
+      block:
+        - name: "Apply ArgoCD Manifests"
+          kubernetes.core.k8s:
+            src: https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+            namespace: argocd
+            state: present
+
+        - name: "Apply the Root 'App-of-Apps'"
+          kubernetes.core.k8s:
+            state: present
+            definition:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Application
+              metadata:
+                name: cluster-root
+                namespace: argocd
+              spec:
+                project: default
+                source:
+                  repoURL: 'https://github.com/samuel-camargo/arch-k8s-rpi.git'
+                  targetRevision: HEAD
+                  path: apps # Watches the folder for longhorn-app.yaml, etc.
+                destination:
+                  server: 'https://kubernetes.default.svc'
+                  namespace: argocd
+                syncPolicy:
+                  automated:
+                    prune: true
+                    selfHeal: true

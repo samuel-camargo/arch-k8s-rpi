@@ -1,0 +1,18 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cluster-networking
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: 'https://github.com/samuel-camargo/arch-k8s-rpi.git'
+    targetRevision: HEAD
+    path: apps/networking
+  destination:
+    server: 'https://kubernetes.default.svc'
+    namespace: kube-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true

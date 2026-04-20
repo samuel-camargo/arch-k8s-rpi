@@ -1,0 +1,10 @@
+# apps/networking/cluster-config.yaml
+# This is a dummy manifest to ensure the namespace exists and tracking is active
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: network-state-marker
+  namespace: kube-system
+data:
+  egress-gate: "wifi"
+  internal-fabric: "lan"

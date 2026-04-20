@@ -1,0 +1,17 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: monitoring-system
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: 'https://github.com/samuel-camargo/arch-k8s-rpi.git'
+    targetRevision: HEAD
+    path: apps/monitoring
+  destination:
+    server: 'https://kubernetes.default.svc'
+    namespace: monitoring-system
+  syncPolicy:
+    automated:
+      createNamespace: true
