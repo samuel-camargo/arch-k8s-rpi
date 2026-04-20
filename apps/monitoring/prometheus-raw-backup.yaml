@@ -1,3 +1,16 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prometheus-vault-pvc
+  namespace: monitoring
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: longhorn-hdd # This forces the backup data onto the Worker HDDs
+  resources:
+    requests:
+      storage: 500Gi
+---
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -10,7 +23,7 @@ spec:
       template:
         spec:
           nodeSelector:
-            kubernetes.io/hostname: kube-master-01
+            kubernetes.io/hostname: kube-master-01 # pod must run here to see the local NVMe
           containers:
           - name: backup-worker
             image: instrumentisto/rsync-ssh:latest
@@ -20,19 +33,20 @@ spec:
             - |
               echo "Ensuring destination directory exists..."
               mkdir -p /destination-vault/prometheus-backup
-              echo "Starting backup of Raw NVMe data..."
+              echo "Starting rsync from NVMe to Longhorn HDD Tier..."
               rsync -rtv --delete /source-nvme/ /destination-vault/prometheus-backup/
               echo "Backup Complete!"
             volumeMounts:
             - mountPath: /source-nvme
               name: nvme-data
+              readOnly: true
             - mountPath: /destination-vault
               name: hdd-vault
           restartPolicy: OnFailure
           volumes:
           - name: nvme-data
             hostPath:
-              path: /var/lib/kubernetes-data
+              path: /var/lib/kubernetes-data # The local physical NVMe source
           - name: hdd-vault
-            hostPath:
-              path: /mnt/backup-vault
+            persistentVolumeClaim:
+              claimName: prometheus-vault-pvc # The managed Longhorn HDD destination

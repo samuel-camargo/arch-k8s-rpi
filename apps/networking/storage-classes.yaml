@@ -1,0 +1,29 @@
+# --- TIER 1: ULTRA (NVMe on Master-01) ---
+kind: StorageClass
+apiVersion: storage.k8s.io/v1
+metadata:
+  name: longhorn-nvme
+provisioner: driver.longhorn.io
+parameters:
+  numberOfReplicas: "1"
+  diskSelector: "nvme" # Tag your Master-01 NVMe as 'nvme'
+---
+# --- TIER 2: FAST (SSD on Master-02) ---
+kind: StorageClass
+apiVersion: storage.k8s.io/v1
+metadata:
+  name: longhorn-ssd
+provisioner: driver.longhorn.io
+parameters:
+  numberOfReplicas: "1"
+  diskSelector: "ssd" # Tag your Master-02 SSD as 'ssd'
+---
+# --- TIER 3: BULK (HDDs on Workers) ---
+kind: StorageClass
+apiVersion: storage.k8s.io/v1
+metadata:
+  name: longhorn-hdd
+provisioner: driver.longhorn.io
+parameters:
+  numberOfReplicas: "2" # Replicate across 2 HDDs for safety
+  diskSelector: "hdd" # Tag your Worker USB drives as 'hdd'

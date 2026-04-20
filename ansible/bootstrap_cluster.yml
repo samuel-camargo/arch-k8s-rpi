@@ -1,8 +1,9 @@
 ---
-- name: "Bootstrap Full DevSecOps Environment"
+- name: "Full Cluster Environment Bootstrap"
   hosts: all
   become: yes
   vars:
+    # Mapping hostnames to their specific IP suffixes
     nodes:
       kube-master-01: 150
       kube-master-02: 151
@@ -11,60 +12,115 @@
       kube-worker-03: 162
 
   tasks:
-    # --- OS & NETWORK FIXES ---
-    - name: "Configure Static LAN & WiFi"
-      block:
-        - name: "Set LAN (10.0.0.x) - No Gateway"
-          copy:
-            dest: /etc/systemd/network/20-lan.network
-            content: |
-              [Match]
-              Name=e*
-              [Network]
-              Address=10.0.0.{{ nodes[inventory_hostname] }}/24
-              DNS=8.8.8.8
 
-        - name: "Set WiFi (192.168.1.x) - Internet Gateway"
-          copy:
-            dest: /etc/systemd/network/25-wifi.network
-            content: |
-              [Match]
-              Name=w*
-              [Network]
-              Address=192.168.1.{{ nodes[inventory_hostname] }}/24
-              Gateway=192.168.1.1
-              DNS=8.8.8.8
+    - name: "Install Storage Prerequisites (iSCSI & NFS)"
+      pacman:
+        name: 
+          - open-iscsi
+          - nfs-utils
+        state: present
+        update_cache: yes
 
-    - name: "Apply Kernel Parameters & Firewall"
-      block:
-        - name: "Sysctl Tweaks"
-          sysctl:
-            name: "{{ item.key }}"
-            value: "{{ item.value }}"
-            sysctl_file: /etc/sysctl.d/99-k8s.conf
-          loop:
-            - { key: 'net.ipv4.ip_forward', value: '1' }
-            - { key: 'net.ipv4.conf.all.rp_filter', value: '0' }
-            - { key: 'net.bridge.bridge-nf-call-iptables', value: '1' }
+    - name: "Ensure iSCSI service is running"
+      systemd:
+        name: iscsid
+        enabled: yes
+        state: started
 
-        - name: "Ensure Masquerade on WiFi"
-          ansible.builtin.iptables:
-            table: nat
-            chain: POSTROUTING
-            out_interface: wld0
-            jump: MASQUERADE
-            action: insert
-            rule_num: 1
+    # --- 1. SYSTEM DEPENDENCIES (ALL NODES) ---
+    - name: "Install Python Kubernetes library for Ansible"
+      pacman:
+        name: python-kubernetes
+        state: present
+        update_cache: yes
 
-    # --- ARGOCD BOOTSTRAP (Master-01 Only) ---
-    - name: "Setup GitOps Engine"
+    - name: "Ensure br_netfilter module is loaded"
+      modprobe:
+        name: br_netfilter
+        state: present
+
+    # --- 2. NETWORK CONFIGURATION (ALL NODES) ---
+    - name: "Configure Static LAN (10.0.0.x) - No Gateway"
+      copy:
+        dest: /etc/systemd/network/20-lan.network
+        content: |
+          [Match]
+          Name=e*
+          [Network]
+          Address=10.0.0.{{ nodes[inventory_hostname] }}/24
+          DNS=8.8.8.8
+          IPv6AcceptRA=no
+
+    - name: "Configure Static WiFi (192.168.1.x) - Internet Gateway"
+      copy:
+        dest: /etc/systemd/network/25-wifi.network
+        content: |
+          [Match]
+          Name=w*
+          [Network]
+          Address=192.168.1.{{ nodes[inventory_hostname] }}/24
+          Gateway=192.168.1.1
+          DNS=8.8.8.8
+          IPv6AcceptRA=no
+
+    - name: "Apply Kernel Parameters for K8s Networking"
+      sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        state: present
+        sysctl_file: /etc/sysctl.d/99-k8s-network.conf
+      loop:
+        - { key: 'net.ipv4.ip_forward', value: '1' }
+        - { key: 'net.ipv4.conf.all.rp_filter', value: '0' }
+        - { key: 'net.ipv4.conf.default.rp_filter', value: '0' }
+        - { key: 'net.bridge.bridge-nf-call-iptables', value: '1' }
+
+    - name: "Ensure Masquerade on WiFi is high priority (Idempotent)"
+      ansible.builtin.iptables:
+        table: nat
+        chain: POSTROUTING
+        out_interface: wld0
+        source: 10.244.0.0/16
+        jump: MASQUERADE
+        action: insert
+        rule_num: 1
+        state: present
+
+    - name: "Ensure Forward policy is ACCEPT"
+      ansible.builtin.iptables:
+        chain: FORWARD
+        policy: ACCEPT
+
+    - name: "Restart Networking (systemd-networkd)"
+      systemd:
+        name: systemd-networkd
+        state: restarted
+
+    # --- 3. ARGOCD BOOTSTRAP (MASTER-01 ONLY) ---
+    - name: "Deploy GitOps Engine"
       when: inventory_hostname == 'kube-master-01'
       block:
-        - name: "Apply ArgoCD Manifests"
+        - name: "Create ArgoCD Namespace"
+          kubernetes.core.k8s:
+            name: argocd
+            kind: Namespace
+            state: present
+
+        - name: "Install ArgoCD Manifests"
           kubernetes.core.k8s:
             src: https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
             namespace: argocd
             state: present
+
+        - name: "Wait for ArgoCD Server to be ready"
+          kubernetes.core.k8s_info:
+            kind: Deployment
+            name: argocd-server
+            namespace: argocd
+          register: argocd_status
+          until: argocd_status.resources[0].status.readyReplicas | default(0) > 0
+          retries: 20
+          delay: 10
 
         - name: "Apply the Root 'App-of-Apps'"
           kubernetes.core.k8s:
@@ -78,11 +134,11 @@
               spec:
                 project: default
                 source:
-                  repoURL: 'https://github.com/samuel-camargo/arch-k8s-rpi.git'
+                  repoURL: "git@github.com:samuel-camargo/arch-k8s-rpi.git"
                   targetRevision: HEAD
-                  path: apps # Watches the folder for longhorn-app.yaml, etc.
+                  path: apps
                 destination:
-                  server: 'https://kubernetes.default.svc'
+                  server: "https://kubernetes.default.svc"
                   namespace: argocd
                 syncPolicy:
                   automated:
