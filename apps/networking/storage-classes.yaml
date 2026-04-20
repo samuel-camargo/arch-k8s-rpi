@@ -6,7 +6,7 @@ metadata:
 provisioner: driver.longhorn.io
 parameters:
   numberOfReplicas: "1"
-  diskSelector: "nvme" # Tag your Master-01 NVMe as 'nvme'
+  diskSelector: "nvme" # This matches your Master-01 tag
 ---
 # --- TIER 2: FAST (SSD on Master-02) ---
 kind: StorageClass
@@ -16,7 +16,7 @@ metadata:
 provisioner: driver.longhorn.io
 parameters:
   numberOfReplicas: "1"
-  diskSelector: "ssd" # Tag your Master-02 SSD as 'ssd'
+  diskSelector: "ssd" # This matches your Master-02 tag
 ---
 # --- TIER 3: BULK (HDDs on Workers) ---
 kind: StorageClass
@@ -25,5 +25,5 @@ metadata:
   name: longhorn-hdd
 provisioner: driver.longhorn.io
 parameters:
-  numberOfReplicas: "2" # Replicate across 2 HDDs for safety
-  diskSelector: "hdd" # Tag your Worker USB drives as 'hdd'
+  numberOfReplicas: "2" # Replicate across 2 Worker HDDs for safety
+  diskSelector: "hdd" # This matches your Worker tags
