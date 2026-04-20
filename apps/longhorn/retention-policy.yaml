@@ -4,6 +4,7 @@ metadata:
   name: daily-retention
   namespace: longhorn-system
 spec:
+  name: daily-retention # <--- Add this line here
   cron: "30 3 * * *" # Runs at 3:30 AM (30 mins after your rsync finishes)
   task: "snapshot"
   groups:
