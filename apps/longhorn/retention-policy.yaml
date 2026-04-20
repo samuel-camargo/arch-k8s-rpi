@@ -1,0 +1,12 @@
+apiVersion: longhorn.io/v1beta2
+kind: RecurringJob
+metadata:
+  name: daily-retention
+  namespace: longhorn-system
+spec:
+  cron: "30 3 * * *" # Runs at 3:30 AM (30 mins after your rsync finishes)
+  task: "snapshot"
+  groups:
+  - default # Applying this to the 'default' group makes it easy to attach
+  retain: 7  # Keep the last 7 days of history
+  concurrency: 1

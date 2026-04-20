@@ -3,6 +3,8 @@ kind: PersistentVolumeClaim
 metadata:
   name: prometheus-vault-pvc
   namespace: monitoring
+  annotations:
+    longhorn.io/recurring-job-group: default
 spec:
   accessModes:
     - ReadWriteOnce
